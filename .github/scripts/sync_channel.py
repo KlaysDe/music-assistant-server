@@ -212,11 +212,13 @@ def official_dev_image() -> tuple[str, dict[str, str]]:
 
 
 def git_init_source(path: Path, repository: str, reference: str) -> str:
-    """Fetch one upstream tag into a minimal clone and return its commit."""
+    """Fetch a complete upstream tag history and return its commit."""
     path.mkdir(parents=True, exist_ok=True)
     run(["git", "init", "--quiet"], cwd=path)
     run(["git", "remote", "add", "origin", f"https://github.com/{repository}.git"], cwd=path)
-    run(["git", "fetch", "--quiet", "--filter=blob:none", "origin", f"refs/tags/{reference}:refs/tags/{reference}"], cwd=path)
+    # The publisher serves this repository to a local git fetch. Upload-pack
+    # disables lazy fetching, so historical blobs must already be present.
+    run(["git", "fetch", "--quiet", "origin", f"refs/tags/{reference}:refs/tags/{reference}"], cwd=path)
     commit = run(["git", "rev-parse", f"refs/tags/{reference}^{{commit}}"], cwd=path)
     run(["git", "checkout", "--quiet", "--detach", commit], cwd=path)
     run(["git", "config", "user.name", "Klay's HA Store release automation"], cwd=path)

@@ -1,12 +1,45 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import sync_channel
+
+
+class SourceTransferTests(unittest.TestCase):
+    def test_source_clone_can_serve_historical_blobs_to_the_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            upstream = root / "upstream"
+            upstream.mkdir()
+            run = sync_channel.run
+            run(["git", "init", "--quiet"], cwd=upstream)
+            for key, value in (("user.name", "Test"), ("user.email", "test@example.test"),
+                               ("uploadpack.allowFilter", "true")):
+                run(["git", "config", key, value], cwd=upstream)
+            for contents in ("historical", "current"):
+                (upstream / "source.txt").write_text(contents, encoding="utf-8")
+                run(["git", "add", "source.txt"], cwd=upstream)
+                run(["git", "commit", "--quiet", "--no-gpg-sign", "-m", contents], cwd=upstream)
+            run(["git", "tag", "nightly"], cwd=upstream)
+            candidate = root / "candidate"
+            with patch.dict(os.environ, {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.{upstream.as_uri()}.insteadOf",
+                "GIT_CONFIG_VALUE_0": "https://github.com/example/server.git",
+            }):
+                commit = sync_channel.git_init_source(candidate, "example/server", "nightly")
+
+            publisher = root / "publisher"
+            publisher.mkdir()
+            run(["git", "init", "--quiet"], cwd=publisher)
+            run(["git", "fetch", str(candidate), f"{commit}:refs/ha-store-staging/server"], cwd=publisher)
+            self.assertEqual(run(["git", "show", f"{commit}^:source.txt"], cwd=publisher), "historical")
 
 
 class NightlySelectionTests(unittest.TestCase):
