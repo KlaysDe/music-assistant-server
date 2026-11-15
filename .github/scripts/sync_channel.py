@@ -455,9 +455,9 @@ def push_qualified_update(
         run(["git", "update-ref", "-d", frontend_local_ref], cwd=channel_root)
 
 
-def resolve_candidate(work_root: Path) -> Candidate:
+def resolve_candidate(work_root: Path, release_token: str | None = None) -> Candidate:
     """Resolve official upstream inputs and deterministically replay the patch anchors."""
-    release = latest_server_release(None)
+    release = latest_server_release(release_token)
     release_tag = str(release["tag_name"])
     digest, platform_info = official_dev_image()
 
@@ -530,7 +530,7 @@ def qualify(work_root: Path) -> Candidate:
     """Replay and test a candidate without repository write credentials."""
     if not os.environ.get("GITHUB_ACTIONS"):
         raise SyncError("Qualification is allowed only from the GitHub Actions workflow")
-    candidate = resolve_candidate(work_root)
+    candidate = resolve_candidate(work_root, os.environ.get("GITHUB_TOKEN"))
     run_qualification(candidate.server_path, candidate.frontend_path)
     write_candidate_outputs(candidate)
     print(
@@ -554,7 +554,7 @@ def publish_qualified(
     if not github_token:
         raise SyncError("Publishing requires the workflow-scoped GITHUB_TOKEN")
 
-    candidate = resolve_candidate(work_root)
+    candidate = resolve_candidate(work_root, github_token)
     if expected != candidate.output_values():
         raise SyncError("Upstream inputs changed after qualification; refusing to publish an untested candidate")
     if channel_has_pins(channel_root, candidate.digest, candidate.server_sha, candidate.frontend_sha):
@@ -631,5 +631,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except SyncError as error:
-        print(f"Release qualification stopped: {error}", file=sys.stderr)
+        message = f"Release qualification stopped: {error}"
+        print(message, file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true" and sys.argv[1:2] == ["publish"]:
+            summary = message.splitlines()[0].replace("%", "%25")
+            print(f"::error::{summary}", file=sys.stderr)
         raise SystemExit(1) from error

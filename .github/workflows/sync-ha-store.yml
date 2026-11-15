@@ -74,6 +74,8 @@ jobs:
       - name: Qualify the latest matching nightly
         id: qualify
         working-directory: channel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           STOP_COMMANDS_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(16))')"
           echo "::stop-commands::$STOP_COMMANDS_TOKEN"
