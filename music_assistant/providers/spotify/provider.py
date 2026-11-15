@@ -183,7 +183,6 @@ class SpotifyProvider(MusicProvider):
             ConfigEntry(
                 key=_OPEN_STATS,
                 type=ConfigEntryType.ACTION,
-                label="Open stats",
                 action=_OPEN_STATS,
                 required=False,
             ),

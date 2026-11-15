@@ -163,7 +163,7 @@
         </table>
       </div>
     </section>
-    <p class="footnote">This view reports upstream API activity. Local pacing wait is shown separately from Spotify rate-limit responses. <span id="history-start"></span></p>
+    <p class="footnote">Counts include retries. Local wait measures time at Music Assistant’s request gate. History is kept in memory. <span id="history-start"></span></p>
   </main>
   <script nonce="__STATS_NONCE__">
     (() => {
@@ -362,6 +362,7 @@
             headers: { "Content-Type": "application/json", "Authorization": `Bearer ${grant}` },
             body: JSON.stringify({ window_minutes: requestedWindow }),
             cache: "no-store",
+            redirect: "error",
             signal: controller.signal
           });
           if (response.status === 401 || response.status === 403) {

@@ -225,6 +225,7 @@ class SpotifySession:
             auth_info = await self._get_auth()
         headers = {**(headers or {}), "Authorization": f"Bearer {auth_info['access_token']}"}
         route = endpoint_label(method, endpoint)
+        self.logger.debug("Spotify Web API %s %s started", self.token_label, route)
         started = time.monotonic()
         status = 0
         try:
