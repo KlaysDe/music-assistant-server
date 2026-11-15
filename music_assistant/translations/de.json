@@ -1129,6 +1129,7 @@
   "provider.spotify.config_entries.auth.label": "Bei Spotify anmelden",
   "provider.spotify.config_entries.auth_dev.description": "Melde dich mit deiner benutzerdefinierten Client-ID an.",
   "provider.spotify.config_entries.auth_dev.label": "Entwicklersitzung authentifizieren",
+  "provider.spotify.config_entries.open_stats.label": "Statistik öffnen",
   "provider.spotify.config_entries.clear_auth.action_label": "Authentifizierung löschen",
   "provider.spotify.config_entries.clear_auth.description": "Lösche die aktuellen Anmeldedaten.",
   "provider.spotify.config_entries.clear_auth.label": "Authentifizierung löschen",

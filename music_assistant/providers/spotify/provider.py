@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import aiohttp
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigActionResult, ConfigEntry
 from music_assistant_models.enums import (
     ConfigEntryType,
     ExternalID,
@@ -26,6 +26,7 @@ from music_assistant_models.enums import (
     StreamType,
 )
 from music_assistant_models.errors import (
+    ActionUnavailable,
     AudioError,
     InvalidDataError,
     LoginFailed,
@@ -119,14 +120,18 @@ from .parsers import (
     parse_podcast_episode,
     parse_track,
 )
+from .request_stats import DEVELOPER_LABEL, MUSIC_ASSISTANT_LABEL, SpotifyRequestStats
 from .session import SpotifySession
+from .stats_page import SpotifyStatsPage
 
 _PLAYLIST_PAGINATION_STATE_LIMIT = 32
+_OPEN_STATS = "open_stats"
 
 # the throttlers of an instance outlive the provider object, so a (re)load of the
 # provider does not lift a rate limit the service imposed. Spotify limits per app, so
 # the key carries the client id: a changed custom Client ID starts with a clean slate
 _THROTTLERS: dict[tuple[str, str, str], ThrottlerManager] = {}
+_REQUEST_HISTORY: dict[str, SpotifyRequestStats] = {}
 
 
 @dataclass(slots=True)
@@ -151,6 +156,8 @@ class SpotifyProvider(MusicProvider):
     dev_session_active: bool = False
     _global_session: SpotifySession
     _dev_session: SpotifySession
+    _request_stats: SpotifyRequestStats
+    _stats_page: SpotifyStatsPage | None = None
     # monotonic time until which the fallback to the global session is not logged again
     _dev_fallback_logged_until: float = 0.0
     backend: SpotifyPlaybackBackend
@@ -172,6 +179,13 @@ class SpotifyProvider(MusicProvider):
                 default_value=False,
                 required=False,
                 hidden=not bool(self.get_setup_value(CONF_CLIENT_ID)),
+            ),
+            ConfigEntry(
+                key=_OPEN_STATS,
+                type=ConfigEntryType.ACTION,
+                label="Open stats",
+                action=_OPEN_STATS,
+                required=False,
             ),
             ConfigEntry(
                 key=CONF_SPOTIFY_NORMALIZATION,
@@ -207,10 +221,21 @@ class SpotifyProvider(MusicProvider):
             ),
         )
 
+    async def handle_config_action(
+        self, action: str
+    ) -> tuple[ConfigEntry, ...] | ConfigActionResult | None:
+        """Open the Spotify request dashboard from the runtime options."""
+        if action == _OPEN_STATS:
+            if self._stats_page is None:
+                raise ActionUnavailable("Spotify request stats are not available yet.")
+            return ConfigActionResult(open_url=self._stats_page.open_url())
+        return await super().handle_config_action(action)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self.cache_dir = os.path.join(self.mass.cache_path, self.instance_id)
         self._playlist_pagination_states = OrderedDict()
+        self._request_stats = _REQUEST_HISTORY.setdefault(self.instance_id, SpotifyRequestStats())
         # global session (heavy rate limited) and developer session (custom client id)
         self._global_session = self._create_session(
             "global",
@@ -282,13 +307,22 @@ class SpotifyProvider(MusicProvider):
                 await self.backend.unload()
             raise
 
+    async def loaded_in_mass(self) -> None:
+        """Mount the request dashboard after Spotify has loaded."""
+        self._stats_page = SpotifyStatsPage(self)
+        self._stats_page.start()
+
     async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         try:
+            if self._stats_page is not None:
+                self._stats_page.close()
+                self._stats_page = None
             if (backend := getattr(self, "backend", None)) is not None:
                 await backend.unload()
         finally:
             if is_removed:
+                _REQUEST_HISTORY.pop(self.instance_id, None)
                 for key in [key for key in _THROTTLERS if key[0] == self.instance_id]:
                     del _THROTTLERS[key]
                 # Both hold reusable login material - the soloist session in the
@@ -391,6 +425,24 @@ class SpotifyProvider(MusicProvider):
             "playback_backend": str(self.get_setup_value(CONF_PLAYBACK_BACKEND) or "librespot"),
             "audiobooks_supported": self._audiobooks_supported,
             **(await self.backend.get_diagnostics() if hasattr(self, "backend") else {}),
+        }
+
+    def request_stats_snapshot(self, window_minutes: int) -> dict[str, SerializableType]:
+        """Return the dashboard's request history and current cooldowns."""
+        return {
+            **self._request_stats.snapshot(window_minutes),
+            "tokens": {
+                MUSIC_ASSISTANT_LABEL: {
+                    "active": True,
+                    "cooldown_seconds": math.ceil(
+                        self._global_session.throttler.cooldown_remaining
+                    ),
+                },
+                DEVELOPER_LABEL: {
+                    "active": self.dev_session_active,
+                    "cooldown_seconds": math.ceil(self._dev_session.throttler.cooldown_remaining),
+                },
+            },
         }
 
     ## Library retrieval methods (generators)
@@ -2108,6 +2160,7 @@ class SpotifyProvider(MusicProvider):
             get_auth,
             on_unauthorized,
             fallback_for_playback=fallback_for_playback,
+            request_stats=self._request_stats,
         )
 
     def _stored_account(self) -> dict[str, Any] | None:
