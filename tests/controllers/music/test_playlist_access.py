@@ -25,12 +25,14 @@ from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
     ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import (
     Genre,
     MediaItemImage,
     Playlist,
     ProviderMapping,
+    Track,
     UniqueList,
 )
 
@@ -131,6 +133,87 @@ async def _visible_ids(playlists: PlaylistController, user: User | None) -> set[
     """Return the library ids the given user sees in the playlist listing."""
     with _as_user(user):
         return {item.item_id for item in await playlists.library_items(limit=1000)}
+
+
+async def test_spotify_playlist_access_journal_is_scoped_and_cursor_based(
+    playlists: PlaylistController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the current user sees an exact Spotify playlist's first-page access."""
+    monkeypatch.setattr(playlists, "_playlist_touches", {})
+    provider = MagicMock(spec=MusicProvider, domain="spotify", instance_id="spotify--owner")
+    monkeypatch.setattr(playlists, "_playlist_provider", MagicMock(return_value=provider))
+    monkeypatch.setattr(
+        "music_assistant.controllers.music.media.playlists.cached_listing",
+        AsyncMock(return_value=[]),
+    )
+    visible = MagicMock(return_value=[provider.instance_id])
+    monkeypatch.setattr(
+        "music_assistant.controllers.music.media.playlists.visible_music_sources", visible
+    )
+    first_id, second_id = "A" * 22, "B" * 22
+    with _as_user(OWNER):
+        await playlists.tracks(first_id, provider.instance_id, offset=100)
+        assert (await playlists.recent_touches())["playlists"] == []
+        await playlists.tracks(first_id, provider.instance_id)
+        first = await playlists.recent_touches()
+        assert first["playlists"] == [
+            {"provider_instance": provider.instance_id, "item_id": first_id}
+        ]
+        cursor = first["cursor"]
+        assert isinstance(cursor, str)
+        assert (await playlists.recent_touches(cursor))["playlists"] == []
+        await playlists.tracks(first_id, provider.instance_id)
+        await playlists.tracks(second_id, provider.instance_id)
+        await playlists.tracks(first_id, provider.instance_id)
+        observed = await playlists.recent_touches(cursor)
+        assert observed["playlists"] == [
+            {"provider_instance": provider.instance_id, "item_id": second_id},
+            {"provider_instance": provider.instance_id, "item_id": first_id},
+        ]
+        assert await playlists.recent_touches("prior-server:18") == observed
+        visible.return_value = []
+        assert (await playlists.recent_touches(cursor))["playlists"] == []
+    with _as_user(MEMBER):
+        assert (await playlists.recent_touches(cursor))["playlists"] == []
+
+
+async def test_provider_playlist_export_uses_exact_instance_and_propagates_page_failure(
+    playlists: PlaylistController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable provider page cannot produce a successful partial export."""
+    monkeypatch.setattr(playlists, "_playlist_touches", {})
+    playlist_id, instance_id = "C" * 22, "spotify--owner"
+    provider = MagicMock(spec=MusicProvider, domain="spotify", instance_id=instance_id)
+    provider.get_playlist = AsyncMock(
+        return_value=_playlist("Spotify playlist", provider_domain="spotify", item_id=playlist_id)
+    )
+    resolve = MagicMock(return_value=provider)
+    monkeypatch.setattr(playlists, "_playlist_provider", resolve)
+    track = Track(
+        item_id="D" * 22,
+        provider=instance_id,
+        name="Spotify track",
+        provider_mappings={
+            ProviderMapping(
+                item_id="D" * 22, provider_domain="spotify", provider_instance=instance_id
+            )
+        },
+    )
+    track_page = AsyncMock(
+        side_effect=([], [track], ResourceTemporarilyUnavailable("Spotify unavailable"))
+    )
+    provider.get_playlist_tracks = track_page
+    monkeypatch.setattr(playlists, "_add_audio_metadata", AsyncMock())
+
+    with _as_user(OWNER):
+        exported = await playlists.export_provider_playlist(playlist_id, instance_id)
+        assert isinstance(exported["m3u_data"], str)
+        assert exported["m3u_data"].startswith("#EXTM3U")
+        with pytest.raises(ResourceTemporarilyUnavailable):
+            await playlists.export_provider_playlist(playlist_id, instance_id)
+        assert (await playlists.recent_touches())["playlists"] == []
+    provider.get_playlist.assert_awaited_with(playlist_id)
+    assert all(args == (instance_id, True) for args, _ in resolve.call_args_list)
 
 
 def _sharing_cases() -> Iterator[Any]:
