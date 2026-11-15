@@ -333,7 +333,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
             offset=offset,
             random_seed=random_seed,
         )
-        if not offset and provider.domain == "spotify" and _SPOTIFY_PLAYLIST_ID.fullmatch(item_id):
+        if not offset:
             self._record_playlist_touch(
                 provider.instance_id, item_id, library_item.item_id if library_item else None
             )
@@ -628,6 +628,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
                     playlist_prov_item_id, provider.instance_id
                 )
                 await self._request_metadata_refresh(playlist)
+        self._record_playlist_touch(provider.instance_id, playlist_prov_item_id, playlist.item_id)
 
     async def match_providers(self, db_item: Playlist) -> None:
         """
@@ -1809,6 +1810,10 @@ class PlaylistController(MediaControllerBase[Playlist]):
         self, provider_instance: str, item_id: str, library_id: str | None
     ) -> None:
         """Record an authenticated user's access to a provider playlist."""
+        if not provider_instance.startswith("spotify--") or not _SPOTIFY_PLAYLIST_ID.fullmatch(
+            item_id
+        ):
+            return
         if (user := get_current_user()) is None:
             return
         journal = self._playlist_touches.get(user.user_id)
@@ -2215,8 +2220,13 @@ class PlaylistController(MediaControllerBase[Playlist]):
         await playlist_prov.add_playlist_tracks(playlist_prov_item_id, ids_to_add)
         # the provider reports each item it could not add as a task failure
         skipped = task.failure_count - failures_before if task else 0
+        added = len(ids_to_add) - skipped
         await self._request_metadata_refresh(playlist)
-        update_current_task_progress(100, f"Added {len(ids_to_add) - skipped} item(s) to playlist")
+        if added > 0:
+            self._record_playlist_touch(
+                playlist_prov.instance_id, playlist_prov_item_id, playlist.item_id
+            )
+        update_current_task_progress(100, f"Added {added} item(s) to playlist")
 
     async def _handle_remove_playlist_tracks(
         self, db_playlist_id: str | int, positions_to_remove: tuple[int, ...], user_id: str | None
@@ -2239,6 +2249,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
             raise InvalidDataError(msg)
         await provider.remove_playlist_tracks(playlist_prov_item_id, positions_to_remove)
         await self._request_metadata_refresh(playlist)
+        self._record_playlist_touch(provider.instance_id, playlist_prov_item_id, playlist.item_id)
 
     async def _get_reorderable_playlist(
         self, db_playlist_id: str | int
