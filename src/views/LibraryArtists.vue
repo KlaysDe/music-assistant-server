@@ -1,0 +1,115 @@
+<template>
+  <ItemsListing
+    fill-height
+    itemtype="artists"
+    path="libraryartists"
+    :show-provider="false"
+    :show-favorites-only-filter="true"
+    :load-paged-data="loadItems"
+    :load-letter-index="loadLetterIndex"
+    :show-album-artists-only-filter="true"
+    :update-available="updateAvailable"
+    :title="$t('artists')"
+    :allow-key-hooks="true"
+    :show-search-button="true"
+    :show-genre-filter="true"
+    :sort-listing="ListingType.LIBRARY_ARTISTS"
+    library-toolbar
+    :icon="ArtistIcon"
+    :restore-state="true"
+    :total="total"
+    :show-provider-filter="true"
+  />
+</template>
+
+<script setup lang="ts">
+import ArtistIcon from "@/components/icons/ArtistIcon.vue";
+import ItemsListing, { LoadDataParams } from "@/components/ItemsListing.vue";
+import { onLibrarySyncCompleted } from "@/composables/useLibrarySync";
+import { useListingTotal } from "@/composables/useListingTotal";
+import api from "@/plugins/api";
+import {
+  ArtistType,
+  EventMessage,
+  EventType,
+  ListingType,
+  MediaType,
+} from "@/plugins/api/interfaces";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+
+defineOptions({
+  name: "Artists",
+});
+
+const updateAvailable = ref(false);
+const { total, setTotal, loadTotal } = useListingTotal();
+
+const loadItems = async function (params: LoadDataParams) {
+  updateAvailable.value = false;
+  // the count only changes with the filters, and those start over from the
+  // first page: the pages after it keep the count they have
+  if (!params.offset) setTotals(params);
+  return await api.getLibraryArtists(
+    params.favoritesOnly || undefined,
+    params.search,
+    params.limit,
+    params.offset,
+    params.sortField,
+    params.sortDirection,
+    params.albumArtistsFilter,
+    params.provider && params.provider.length > 0 ? params.provider : undefined,
+    params.genreIds,
+    ArtistType.SINGER,
+    params.randomSeed,
+  );
+};
+
+const loadLetterIndex = function (params: LoadDataParams) {
+  return api.getLibraryLetterIndex("artists", {
+    favorite: params.favoritesOnly || undefined,
+    search: params.search,
+    sort_field: params.sortField,
+    sort_direction: params.sortDirection,
+    album_artists_only: params.albumArtistsFilter,
+    provider: params.provider?.length ? params.provider : undefined,
+    genre: params.genreIds,
+    artist_type: ArtistType.SINGER,
+  });
+};
+
+const setTotals = async function (params: LoadDataParams) {
+  // When provider filter is active, we can't get accurate count from the count endpoint
+  // The total will be determined by the actual results returned
+  if (params.provider && params.provider.length > 0) {
+    setTotal(undefined);
+    return;
+  }
+  await loadTotal(
+    api.getLibraryArtistsCount(
+      params.favoritesOnly || false,
+      params.albumArtistsFilter || false,
+      ArtistType.SINGER,
+    ),
+  );
+};
+
+onMounted(() => {
+  // signal if/when items get added/updated/removed within this library
+  const unsub = api.subscribe(
+    EventType.MEDIA_ITEM_ADDED,
+    (evt: EventMessage) => {
+      // signal user that there might be updated info available for this item
+      if (evt.object_id?.startsWith("library://artist")) {
+        updateAvailable.value = true;
+      }
+    },
+  );
+  onBeforeUnmount(unsub);
+  // per-item add events are suppressed during provider library syncs; also
+  // refresh when a sync covering this media type finishes
+  const unsubSync = onLibrarySyncCompleted(MediaType.ARTIST, () => {
+    updateAvailable.value = true;
+  });
+  onBeforeUnmount(unsubSync);
+});
+</script>

@@ -1,0 +1,432 @@
+/**
+ * The canvas must not open a relay connection before its hosting view has
+ * resolved which player it shows: the server picks a player itself when none
+ * is named, so an early connection would visualize a different player's audio
+ * for as long as the id takes to arrive.
+ */
+import VisualizerCanvas from "@/components/VisualizerCanvas.vue";
+import { currentVisualizerPreset } from "@/composables/visualizer/state";
+import api from "@/plugins/api";
+import { PlaybackState } from "@/plugins/api/interfaces";
+import { flushPromises, mount } from "@vue/test-utils";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+
+const relayConstructor = vi.hoisted(() => vi.fn());
+const relayClose = vi.hoisted(() => vi.fn());
+vi.mock("@/plugins/visualizer-relay", () => ({
+  VisualizerRelayClient: class {
+    constructor(...args: unknown[]) {
+      relayConstructor(...args);
+    }
+    connect() {}
+    close() {
+      relayClose();
+    }
+    currentFrame() {
+      return null;
+    }
+    reportError() {}
+  },
+}));
+
+const setPaused = vi.hoisted(() => vi.fn());
+const setPaletteColors = vi.hoisted(() => vi.fn());
+const setPaletteRamp = vi.hoisted(() => vi.fn());
+const loadPresetByName = vi.hoisted(() => vi.fn(async (name: string) => name));
+// The real module keeps the timing constants; only the engine itself is faked.
+vi.mock(
+  "@/composables/visualizer/useVisualizerEngine",
+  async (importOriginal) => ({
+    ...(await importOriginal<object>()),
+    isVisualizerSupported: () => true,
+    createVisualizerEngine: vi.fn(async () => ({
+      loadPresetByName,
+      loadRandomPreset: vi.fn(async () => "preset"),
+      setPaused,
+      setPaletteColors,
+      setPaletteRamp,
+      destroy: vi.fn(),
+    })),
+  }),
+);
+
+const preferenceOverrides = vi.hoisted(() => ({}) as Record<string, unknown>);
+vi.mock("@/composables/userPreferences", () => ({
+  useUserPreferences: () => ({
+    getPreference: (key: string, fallback: unknown) => ({
+      value: key in preferenceOverrides ? preferenceOverrides[key] : fallback,
+    }),
+  }),
+}));
+
+vi.mock("@/helpers/visualizer/presetLibrary", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  listPresetNames: vi.fn(async () => ["kept", "also kept"]),
+  randomPresetName: vi.fn(async () => "preset"),
+}));
+
+vi.mock("@/plugins/api", async () => {
+  const { reactive } = await import("vue");
+  return {
+    default: { isRemoteConnection: { value: false }, players: reactive({}) },
+  };
+});
+
+vi.mock("@/plugins/store", () => ({
+  store: { showFullscreenPlayer: false },
+}));
+
+const themeIsDark = vi.hoisted(() => ({ value: false }));
+vi.mock("@/composables/useThemePreference", () => ({
+  isDark: themeIsDark,
+}));
+
+function mountCanvas(playerId: string) {
+  return mount(VisualizerCanvas, { props: { playerId } });
+}
+
+describe("VisualizerCanvas relay connection", () => {
+  beforeAll(() => {
+    // jsdom lays everything out at zero, and the canvas defers startup until
+    // it has real size; give it some so initialization runs.
+    for (const dimension of ["clientWidth", "clientHeight"]) {
+      Object.defineProperty(HTMLCanvasElement.prototype, dimension, {
+        configurable: true,
+        value: 640,
+      });
+    }
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("waits for the player id instead of letting the server pick one", async () => {
+    const wrapper = mountCanvas("");
+    await flushPromises();
+
+    expect(relayConstructor).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("connects as soon as the hosting view resolves the player", async () => {
+    const wrapper = mountCanvas("");
+    await flushPromises();
+
+    await wrapper.setProps({ playerId: "kitchen" });
+    await flushPromises();
+
+    expect(relayConstructor).toHaveBeenCalledTimes(1);
+    expect(relayConstructor.mock.calls[0][1]).toBe("kitchen");
+    wrapper.unmount();
+  });
+
+  it("connects straight away when the player is known at mount", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    expect(relayConstructor).toHaveBeenCalledTimes(1);
+    expect(relayConstructor.mock.calls[0][1]).toBe("kitchen");
+    wrapper.unmount();
+  });
+
+  it("follows the viewed player when it changes", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    await wrapper.setProps({ playerId: "living_room" });
+    await flushPromises();
+
+    expect(relayConstructor).toHaveBeenCalledTimes(2);
+    expect(relayConstructor.mock.calls[1][1]).toBe("living_room");
+    wrapper.unmount();
+  });
+});
+
+describe("VisualizerCanvas playback gating", () => {
+  const player = () =>
+    (api.players as Record<string, { playback_state: PlaybackState }>).kitchen;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    (api.players as Record<string, { playback_state: PlaybackState }>).kitchen =
+      { playback_state: PlaybackState.PLAYING };
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("winds the visualizer down once the player stops playing", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    player().playback_state = PlaybackState.PAUSED;
+    await flushPromises();
+    // Not yet: the settle delay has to pass first.
+    expect(setPaused).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(2000);
+    expect(setPaused).toHaveBeenCalledWith(true);
+
+    await flushPromises();
+    expect(wrapper.get(".visualizer-layer").attributes("style")).toContain(
+      "opacity: 0",
+    );
+    wrapper.unmount();
+  });
+
+  it("keeps rendering through a brief drop out of playing", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    player().playback_state = PlaybackState.IDLE;
+    await flushPromises();
+    vi.advanceTimersByTime(200);
+    player().playback_state = PlaybackState.PLAYING;
+    await flushPromises();
+    vi.advanceTimersByTime(2000);
+
+    expect(setPaused).not.toHaveBeenCalledWith(true);
+    wrapper.unmount();
+  });
+
+  it("resumes as soon as playback comes back", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    player().playback_state = PlaybackState.PAUSED;
+    await flushPromises();
+    vi.advanceTimersByTime(2000);
+
+    player().playback_state = PlaybackState.PLAYING;
+    await flushPromises();
+
+    expect(setPaused).toHaveBeenLastCalledWith(false);
+    expect(wrapper.get(".visualizer-layer").attributes("style")).toContain(
+      "opacity: 1",
+    );
+    wrapper.unmount();
+  });
+
+  it("starts up halted when the player is already paused", async () => {
+    (api.players as Record<string, { playback_state: PlaybackState }>).kitchen =
+      { playback_state: PlaybackState.PAUSED };
+
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    // No wind-down to run: there is nothing on screen yet.
+    expect(setPaused).toHaveBeenCalledWith(true, false);
+    wrapper.unmount();
+  });
+});
+
+describe("VisualizerCanvas favourites", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    preferenceOverrides.visualizer_preset_mode = "random_favorites";
+    preferenceOverrides.visualizer_favorites = ["gone", "kept"];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(preferenceOverrides))
+      delete preferenceOverrides[key];
+  });
+
+  it("never picks a favourite the library no longer has", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    expect(loadPresetByName).toHaveBeenCalledWith("kept", expect.anything());
+    expect(loadPresetByName).not.toHaveBeenCalledWith(
+      "gone",
+      expect.anything(),
+    );
+    wrapper.unmount();
+  });
+
+  it("falls back to a random preset when no favourite is left", async () => {
+    preferenceOverrides.visualizer_favorites = ["gone"];
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    expect(loadPresetByName).toHaveBeenCalledWith("preset", expect.anything());
+    wrapper.unmount();
+  });
+});
+
+describe("VisualizerCanvas shown preset", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    preferenceOverrides.visualizer_preset_mode = "fixed";
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(preferenceOverrides))
+      delete preferenceOverrides[key];
+  });
+
+  const mountWithPreset = async (preset: string) => {
+    const wrapper = mount(VisualizerCanvas, {
+      props: { playerId: "kitchen", preset },
+    });
+    await flushPromises();
+    return wrapper;
+  };
+
+  it("keeps the previous preset when the engine fails to load the next", async () => {
+    const wrapper = await mountWithPreset("first");
+    loadPresetByName.mockResolvedValueOnce("");
+
+    await wrapper.setProps({ preset: "second" });
+    await flushPromises();
+
+    expect(currentVisualizerPreset.value).toBe("first");
+    wrapper.unmount();
+  });
+
+  it("shows the preset the engine fell back to, not the one requested", async () => {
+    const wrapper = await mountWithPreset("first");
+    loadPresetByName.mockResolvedValueOnce("fallback");
+
+    await wrapper.setProps({ preset: "dropped" });
+    await flushPromises();
+
+    expect(currentVisualizerPreset.value).toBe("fallback");
+    wrapper.unmount();
+  });
+});
+
+describe("VisualizerCanvas artwork recoloring", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (api.players as Record<string, { playback_state: PlaybackState }>).kitchen =
+      { playback_state: PlaybackState.PLAYING };
+  });
+
+  // The scrim only shows once streaming, like the relay's real onState.
+  function emitStreaming() {
+    const onState = relayConstructor.mock.calls.at(-1)?.[0]?.onState as
+      ((state: string) => void) | undefined;
+    onState?.("streaming");
+  }
+
+  function emitColor(palette: Record<string, unknown>) {
+    const onColor = relayConstructor.mock.calls.at(-1)?.[0]?.onColor as
+      ((palette: unknown) => void) | undefined;
+    onColor?.(palette);
+  }
+
+  it("fades the canvas itself, per the opacity setting", async () => {
+    const wrapper = mount(VisualizerCanvas, {
+      props: { playerId: "kitchen", opacity: 40 },
+    });
+    await flushPromises();
+    emitStreaming();
+    emitColor({ on_dark: [10, 20, 30] });
+    await flushPromises();
+
+    expect(
+      wrapper.get(".visualizer-layer__canvas").attributes("style"),
+    ).toContain("opacity: 0.4");
+    expect(
+      wrapper.get(".visualizer-layer__stack").attributes("style") ?? "",
+    ).not.toContain("opacity");
+    wrapper.unmount();
+  });
+
+  it("hands the engine a ramp built from the relay's palette", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+    emitStreaming();
+    emitColor({
+      background_light: [240, 240, 240],
+      primary: [200, 0, 0],
+      accent: [0, 0, 255],
+      on_light: [20, 20, 20],
+    });
+    await flushPromises();
+
+    expect(setPaletteRamp).toHaveBeenLastCalledWith(
+      [
+        [20, 20, 20],
+        [0, 0, 255],
+        [200, 0, 0],
+        [240, 240, 240],
+      ],
+      0.75,
+    );
+    wrapper.unmount();
+  });
+
+  it("applies a palette that arrived before the engine was created", async () => {
+    // The server replays the cached palette right after connect, while the
+    // engine is still starting up.
+    relayConstructor.mockImplementationOnce(
+      (callbacks: { onColor: (palette: unknown) => void }) =>
+        callbacks.onColor({
+          background_light: [240, 240, 240],
+          primary: [200, 0, 0],
+          accent: [0, 0, 255],
+          on_light: [20, 20, 20],
+        }),
+    );
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+
+    expect(setPaletteColors).toHaveBeenLastCalledWith([
+      [20, 20, 20],
+      [200, 0, 0],
+      [0, 0, 255],
+      [20, 20, 20],
+    ]);
+    expect(setPaletteRamp).toHaveBeenLastCalledWith(
+      [
+        [20, 20, 20],
+        [0, 0, 255],
+        [200, 0, 0],
+        [240, 240, 240],
+      ],
+      0.75,
+    );
+    wrapper.unmount();
+  });
+
+  it("drops the recoloring when the player changes, before the new relay speaks", async () => {
+    const wrapper = mountCanvas("kitchen");
+    await flushPromises();
+    emitStreaming();
+    emitColor({
+      primary: [10, 20, 30],
+      accent: [1, 2, 3],
+      on_light: [4, 5, 6],
+    });
+    await flushPromises();
+    expect(setPaletteRamp).toHaveBeenLastCalledWith(expect.any(Array), 0.75);
+
+    await wrapper.setProps({ playerId: "living_room" });
+    await flushPromises();
+
+    // an emptied palette yields no anchors, so the previous track's colours
+    // must not linger on screen
+    expect(setPaletteRamp).toHaveBeenLastCalledWith(null, 0.75);
+    wrapper.unmount();
+  });
+});

@@ -1,0 +1,100 @@
+<template>
+  <ItemsListing
+    fill-height
+    itemtype="podcasts"
+    path="librarypodcasts"
+    :show-duration="false"
+    :show-provider="true"
+    :show-favorites-only-filter="true"
+    :load-paged-data="loadItems"
+    :show-library="true"
+    :sort-listing="ListingType.LIBRARY_PODCASTS"
+    library-toolbar
+    :update-available="updateAvailable"
+    :title="$t('podcasts')"
+    :allow-key-hooks="true"
+    :show-search-button="true"
+    :icon="Podcast"
+    :restore-state="true"
+    :total="total"
+    :show-provider-filter="true"
+    :show-genre-filter="true"
+  />
+</template>
+
+<script setup lang="ts">
+import ItemsListing, { LoadDataParams } from "@/components/ItemsListing.vue";
+import { onLibrarySyncCompleted } from "@/composables/useLibrarySync";
+import { useListingTotal } from "@/composables/useListingTotal";
+import api from "@/plugins/api";
+import {
+  EventMessage,
+  EventType,
+  ListingType,
+  MediaType,
+} from "@/plugins/api/interfaces";
+import { store } from "@/plugins/store";
+import { Podcast } from "@lucide/vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+
+defineOptions({
+  name: "Podcasts",
+});
+
+const updateAvailable = ref(false);
+const { total, setTotal, loadTotal } = useListingTotal(
+  store.libraryPodcastsCount,
+);
+
+const loadItems = async function (params: LoadDataParams) {
+  updateAvailable.value = false;
+  // the count only changes with the filters, and those start over from the
+  // first page: the pages after it keep the count they have
+  if (!params.offset) setTotals(params);
+  return await api.getLibraryPodcasts(
+    params.favoritesOnly || undefined,
+    params.search,
+    params.limit,
+    params.offset,
+    params.sortField,
+    params.sortDirection,
+    params.provider && params.provider.length > 0 ? params.provider : undefined,
+    params.genreIds,
+    params.randomSeed,
+  );
+};
+
+const setTotals = async function (params: LoadDataParams) {
+  if (!params.favoritesOnly && !params.provider) {
+    setTotal(store.libraryPodcastsCount);
+    return;
+  }
+  // When provider filter is active, we can't get accurate count from the count endpoint
+  // The total will be determined by the actual results returned
+  if (params.provider && params.provider.length > 0) {
+    setTotal(undefined);
+    return;
+  }
+  await loadTotal(api.getLibraryPodcastsCount(params.favoritesOnly || false));
+};
+
+onMounted(() => {
+  // signal if/when items get added within this library
+  const unsub = api.subscribe(
+    EventType.MEDIA_ITEM_ADDED,
+    (evt: EventMessage) => {
+      // signal user that there might be updated info available for this item
+      if (evt.object_id?.startsWith("library://podcast")) {
+        updateAvailable.value = true;
+      }
+    },
+  );
+  onBeforeUnmount(unsub);
+  // per-item add events are suppressed during provider library syncs; also
+  // refresh when a sync covering this media type finishes
+  const unsubSync = onLibrarySyncCompleted(MediaType.PODCAST, () => {
+    updateAvailable.value = true;
+  });
+  onBeforeUnmount(unsubSync);
+});
+</script>

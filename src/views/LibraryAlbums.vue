@@ -1,0 +1,118 @@
+<template>
+  <ItemsListing
+    fill-height
+    itemtype="albums"
+    path="libraryalbums"
+    :show-provider="false"
+    :show-favorites-only-filter="true"
+    :load-paged-data="loadItems"
+    :load-letter-index="loadLetterIndex"
+    :sort-listing="ListingType.LIBRARY_ALBUMS"
+    library-toolbar
+    :update-available="updateAvailable"
+    :title="$t('albums')"
+    :allow-key-hooks="true"
+    :show-search-button="true"
+    :show-genre-filter="true"
+    :icon="Disc3"
+    :restore-state="true"
+    :total="total"
+    :show-album-type-filter="true"
+    :show-provider-filter="true"
+  />
+</template>
+
+<script setup lang="ts">
+import ItemsListing, { LoadDataParams } from "@/components/ItemsListing.vue";
+import { onLibrarySyncCompleted } from "@/composables/useLibrarySync";
+import { useListingTotal } from "@/composables/useListingTotal";
+import api from "@/plugins/api";
+import {
+  EventMessage,
+  EventType,
+  ListingType,
+  MediaType,
+} from "@/plugins/api/interfaces";
+import { store } from "@/plugins/store";
+import { Disc3 } from "@lucide/vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+
+defineOptions({
+  name: "Albums",
+});
+
+const updateAvailable = ref<boolean>(false);
+const { total, setTotal, loadTotal } = useListingTotal(
+  store.libraryAlbumsCount,
+);
+
+onMounted(() => {
+  // signal if/when items get added within this library
+  const unsub = api.subscribe(
+    EventType.MEDIA_ITEM_ADDED,
+    (evt: EventMessage) => {
+      // signal user that there might be updated info available for this item
+      if (evt.object_id?.startsWith("library://album")) {
+        updateAvailable.value = true;
+      }
+    },
+  );
+  onBeforeUnmount(unsub);
+  // per-item add events are suppressed during provider library syncs; also
+  // refresh when a sync covering this media type finishes
+  const unsubSync = onLibrarySyncCompleted(MediaType.ALBUM, () => {
+    updateAvailable.value = true;
+  });
+  onBeforeUnmount(unsubSync);
+});
+
+const loadItems = async function (params: LoadDataParams) {
+  updateAvailable.value = false;
+  // the count only changes with the filters, and those start over from the
+  // first page: the pages after it keep the count they have
+  if (!params.offset) setTotals(params);
+  return await api.getLibraryAlbums(
+    params.favoritesOnly || undefined,
+    params.search,
+    params.limit,
+    params.offset,
+    params.sortField,
+    params.sortDirection,
+    params.albumType,
+    params.provider && params.provider.length > 0 ? params.provider : undefined,
+    params.genreIds,
+    params.randomSeed,
+  );
+};
+
+const loadLetterIndex = function (params: LoadDataParams) {
+  return api.getLibraryLetterIndex("albums", {
+    favorite: params.favoritesOnly || undefined,
+    search: params.search,
+    sort_field: params.sortField,
+    sort_direction: params.sortDirection,
+    album_types: params.albumType,
+    provider: params.provider?.length ? params.provider : undefined,
+    genre: params.genreIds,
+  });
+};
+
+const setTotals = async function (params: LoadDataParams) {
+  if (!params.favoritesOnly && !params.albumType && !params.provider) {
+    setTotal(store.libraryAlbumsCount);
+    return;
+  }
+  // When provider filter is active, we can't get accurate count from the count endpoint
+  // The total will be determined by the actual results returned
+  if (params.provider && params.provider.length > 0) {
+    setTotal(undefined);
+    return;
+  }
+  await loadTotal(
+    api.getLibraryAlbumsCount(
+      params.favoritesOnly || undefined,
+      params.albumType || undefined,
+    ),
+  );
+};
+</script>

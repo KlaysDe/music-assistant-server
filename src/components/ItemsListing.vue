@@ -1,0 +1,2984 @@
+<!-- eslint-disable vue/no-v-for-template-key-on-child -->
+<template>
+  <section
+    v-if="!(hideOnEmpty && pagedItems.length == 0 && !hasActiveFilters)"
+    ref="sectionEl"
+    :class="{
+      'flex min-h-full flex-1 flex-col': fillsHeight,
+      'ps-[11px] pe-[18px] max-[769px]:ps-0 max-[769px]:pe-[6px]': detailRow,
+    }"
+  >
+    <!-- eslint-disable vue/no-template-shadow -->
+    <!-- inset so the title lines up with the row artwork and the menu with the rows' menu -->
+    <Toolbar
+      class="ps-[5px] pe-[7px]"
+      :icon="icon"
+      :icon-action="iconAction"
+      :title="title"
+      :subtitle="subtitle"
+      :count="params.search ? pagedItems.length : (total ?? pagedItems.length)"
+      color="transparent"
+      :menu-items="menuItems"
+      :enforce-overflow-menu="true"
+      :menu-active="hasActiveFilters && !libraryToolbar"
+      @title-clicked="toggleExpand"
+    >
+      <template #title>
+        <!-- the detail pages' section title -->
+        <span
+          v-if="detailRow"
+          class="ms-0.5 text-[22px] font-bold tracking-[-0.4px] max-[769px]:text-[19px]"
+          >{{ title }}</span
+        >
+        <slot v-else name="title">{{ title }}</slot>
+        <span
+          v-if="libraryToolbar && showCount && listingCount !== undefined"
+          class="ms-2 text-base font-normal text-muted-foreground"
+        >
+          {{ listingCount }}
+        </span>
+      </template>
+
+      <template #append>
+        <template v-if="collapsed">
+          <Button
+            variant="ghost"
+            size="icon-lg"
+            :title="$t('tooltip.collapse_expand')"
+            :aria-label="$t('tooltip.collapse_expand')"
+            aria-expanded="false"
+            @click="toggleExpand"
+          >
+            <ChevronDown class="size-[22px]" />
+          </Button>
+          <!-- holds the menu's place, so the button stays where it sits when expanded -->
+          <span
+            v-if="hasOverflowMenu"
+            class="size-10"
+            aria-hidden="true"
+          ></span>
+        </template>
+        <LibrarySortControls
+          v-if="
+            !collapsed &&
+            !libraryToolbar &&
+            props.sortListing &&
+            sortOptionsLoaded &&
+            sortOptions.length
+          "
+          mode="menu"
+          :options="sortOptions"
+          :sort-by="params.sortBy"
+          @sort-by="changeSort"
+        />
+        <Button
+          v-if="
+            libraryToolbar &&
+            searchAvailable &&
+            expanded &&
+            !searchButtonCloses &&
+            !searchSlotShown
+          "
+          ref="searchButtonRef"
+          variant="ghost"
+          size="icon-lg"
+          :title="$t('search')"
+          :aria-label="$t('search')"
+          :aria-expanded="showSearchInput"
+          @click="toggleSearch"
+        >
+          <Search class="size-[22px]" />
+        </Button>
+        <Transition
+          v-if="!store.mobileLayout"
+          name="listing-search"
+          @before-enter="searchSlotShown = true"
+          @before-leave="onSearchSlotLeave"
+          @after-leave="onSearchSlotLeft"
+        >
+          <!-- the input follows the slot's edge as it opens, and the padding
+               keeps its 3px focus ring inside the clipped area. With the title
+               bar controls it grows out of the search icon's width and shrinks
+               back to it, so the controls beside it do not jump -->
+          <div
+            v-if="showSearchInput"
+            class="listing-search-slot -m-[3px] box-content p-[3px]"
+            :class="{
+              '[&.listing-search-enter-from]:w-10 [&.listing-search-leave-to]:w-10':
+                libraryToolbar,
+            }"
+          >
+            <SearchInput
+              ref="searchInputRef"
+              v-model="params.search"
+              :clearable="!libraryToolbar"
+              class="listing-search listing-search--inline"
+              :placeholder="searchLabel"
+              :aria-label="searchLabel"
+              @focus="searchHasFocus = true"
+              @blur="searchHasFocus = false"
+            >
+              <!-- the search icon gives way to the field, so it closes here -->
+              <template v-if="libraryToolbar" #append>
+                <InputGroupAddon align="inline-end">
+                  <InputGroupButton
+                    size="icon-xs"
+                    class="text-muted-foreground"
+                    :title="$t('close')"
+                    :aria-label="$t('close')"
+                    @click="closeSearch"
+                  >
+                    <X />
+                  </InputGroupButton>
+                </InputGroupAddon>
+              </template>
+            </SearchInput>
+          </div>
+        </Transition>
+        <ListingToolbarControls
+          v-if="libraryToolbar && !collapsed"
+          :sort-options="sortOptionsLoaded ? sortOptions : []"
+          :sort-by="params.sortBy"
+          :view-mode="viewMode"
+          :show-view-modes="!forcedViewMode"
+          :grid-controls="gridControlProps"
+          :filters="listingFilters"
+          :active-filter-count="activeFilters"
+          :compact="store.mobileLayout"
+          @sort-by="changeSort"
+          @view-mode="selectViewMode"
+          @clear-filters="clearFilters"
+        />
+      </template>
+    </Toolbar>
+
+    <div v-if="showSortChipsRow" class="listing-sort-chips-row h-12">
+      <LibrarySortControls
+        v-if="sortOptionsLoaded && sortOptions.length"
+        mode="chips"
+        :options="sortOptions"
+        :sort-by="params.sortBy"
+        @sort-by="changeSort"
+      />
+    </div>
+
+    <v-divider v-if="!detailRow" />
+
+    <slot name="header"></slot>
+
+    <div v-if="props.toolBarTabs !== undefined" class="content-tabs">
+      <Tabs
+        :model-value="activeTabId"
+        class="items-start"
+        @update:model-value="(v) => onTabChange(v as string)"
+      >
+        <TabsList variant="line">
+          <TabsTrigger
+            v-for="tab in props.toolBarTabs"
+            :key="tab.id"
+            :value="tab.id"
+          >
+            {{ tab.label }}
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+    </div>
+
+    <div
+      v-if="showSearchInput && store.mobileLayout"
+      class="mx-2.5 mt-2.5 flex items-center gap-1"
+    >
+      <SearchInput
+        ref="searchInputRef"
+        v-model="params.search"
+        clearable
+        class="listing-search listing-search--row min-w-0 flex-1"
+        :placeholder="searchLabel"
+        :aria-label="searchLabel"
+        @focus="searchHasFocus = true"
+        @blur="searchHasFocus = false"
+      />
+      <Button
+        variant="ghost"
+        size="icon"
+        class="size-10 shrink-0"
+        :aria-label="$t('close')"
+        :title="$t('close')"
+        @click="closeSearch"
+      >
+        <X class="size-[22px]" />
+      </Button>
+    </div>
+
+    <div
+      v-if="expanded"
+      ref="listContainer"
+      class="overflow-hidden p-2.5"
+      :class="{
+        'bg-background dark:bg-transparent': viewMode != 'list',
+        'flex flex-1 flex-col': fillsHeight,
+        'pr-9 pointer-coarse:pr-10': showLetterBar,
+      }"
+    >
+      <TrackTableHeader
+        v-if="showTrackTable && (loadPending || pagedItems.length)"
+        :columns="trackRowColumns"
+        :enabled="enabledTrackColumns"
+        @update:enabled="setEnabledTrackColumns"
+      />
+      <!-- Skeleton loading states -->
+      <template v-if="loadPending && pagedItems.length === 0">
+        <div v-if="viewMode === 'list'">
+          <ListViewSkeleton v-for="n in 8" :key="'skeleton-list-' + n" />
+        </div>
+        <v-row v-else-if="viewMode === 'panel'">
+          <v-col
+            v-for="n in 12"
+            :key="'skeleton-panel-' + n"
+            cols="12"
+            :class="`col-${gridColumnCount}`"
+          >
+            <PanelViewSkeleton />
+          </v-col>
+        </v-row>
+      </template>
+
+      <!-- the infinite scroller can't show its own retry before any item is loaded -->
+      <Empty v-if="firstLoadFailed" class="border-none">
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <TriangleAlert />
+          </EmptyMedia>
+          <EmptyTitle>{{ $t("items_load_failed") }}</EmptyTitle>
+        </EmptyHeader>
+        <EmptyContent>
+          <Button variant="outline" size="sm" @click="loadData(true)">
+            {{ $t("settings.retry") }}
+          </Button>
+        </EmptyContent>
+      </Empty>
+
+      <!-- the rows above a jump's target load as this nears the visible area -->
+      <div
+        v-if="baseOffset > 0 && pagedItems.length"
+        ref="topSentinel"
+        class="flex justify-center py-4"
+      >
+        <Spinner class="size-8" />
+      </div>
+
+      <v-infinite-scroll
+        v-if="
+          !tempHide &&
+          !firstLoadFailed &&
+          !(pagedItems.length == 0 && allItemsReceived) &&
+          !(loadPending && pagedItems.length === 0)
+        "
+        ref="infiniteScrollEl"
+        :onLoad="loadNextPage"
+        :mode="infiniteScroll ? 'intersect' : 'manual'"
+        :margin="INFINITE_SCROLL_MARGIN"
+        :load-more-text="$t('load_more_items')"
+        :empty-text="''"
+        :class="{ 'select-none': shiftSelecting }"
+        style="overflow: hidden"
+      >
+        <!-- the end marker sits INFINITE_SCROLL_MARGIN above the end of the list,
+        so a shorter list clips it and never reports that it has no more items -->
+        <template #loading>
+          <Spinner v-if="!allItemsReceived" class="size-8" />
+        </template>
+        <template #error="{ props: errorProps }">
+          <div class="flex justify-center py-4">
+            <Button
+              variant="outline"
+              size="sm"
+              @click="retryLoad(errorProps.onClick)"
+            >
+              {{ $t("settings.retry") }}
+            </Button>
+          </div>
+        </template>
+        <!-- panel view -->
+        <v-row v-if="viewMode == 'panel'" ref="panelRow">
+          <!-- keeps each card in the column of its listing row, so rows loaded
+               above add whole grid rows and the cards on screen stay put -->
+          <div
+            v-for="n in baseOffset % gridColumnCount"
+            :key="'spacer-' + n"
+            :class="`col-${gridColumnCount}`"
+            aria-hidden="true"
+          ></div>
+          <v-col
+            v-for="(item, index) in pagedItems"
+            :key="item.uri"
+            :data-listing-index="index"
+            cols="12"
+            :class="`col-${gridColumnCount}`"
+          >
+            <PanelviewItem
+              :item="item"
+              :is-selected="isSelected(item)"
+              :show-checkboxes="showCheckboxes && !isParentDirItem(item)"
+              :show-actions="showGridActions && supportsGridActions"
+              :show-track-number="showTrackNumber"
+              :is-available="itemIsAvailable(item)"
+              :is-playing="isPlaying(item, itemtype)"
+              :disable-play-button="isPlayActionInProgress"
+              :parent-item="parentItem"
+              :sort-by="props.sortListing ? undefined : params.sortBy"
+              :sort-field="displayedSort.sortField"
+              :sort-direction="displayedSort.sortDirection"
+              @select="onSelect"
+            />
+          </v-col>
+        </v-row>
+
+        <!-- list view -->
+        <div
+          v-if="viewMode == 'list'"
+          ref="listRowsEl"
+          class="relative h-full"
+          :aria-busy="reorderSaving || undefined"
+        >
+          <!-- rows loaded above a letter jump would shift every row's position,
+               so those listings tie each row to its item instead -->
+          <v-virtual-scroll
+            :item-height="showTrackTable ? TRACK_ROW_HEIGHT : 70"
+            height="100%"
+            :items="listDisplayItems"
+            :item-key="letterIndexLoader ? 'uri' : undefined"
+            style="height: 100%; overflow: hidden"
+          >
+            <template #default="{ item, index }">
+              <div v-if="'isDiscHeader' in item" class="disc-header">
+                {{ $t("disc", { number: item.disc }) }}
+              </div>
+              <TrackTableRow
+                v-else-if="showTrackTable"
+                :item="item"
+                :index="index"
+                :data-listing-index="index"
+                :columns="trackRowColumns"
+                :class="[
+                  trackRowDragClass(item, index),
+                  isDragging && 'transition-transform duration-200 ease-out',
+                ]"
+                :style="trackRowDragStyle(index)"
+                :show-checkboxes="showCheckboxes"
+                :is-selected="isSelected(item)"
+                :is-available="itemIsAvailable(item)"
+                :is-playing="isPlaying(item, itemtype)"
+                :disable-play-button="isPlayActionInProgress"
+                :reorder-disabled="reorderSaving"
+                :parent-item="parentItem"
+                :sort-by="props.sortListing ? undefined : params.sortBy"
+                :sort-field="displayedSort.sortField"
+                :sort-direction="displayedSort.sortDirection"
+                @select="onSelect"
+                @drag-start="(evt: PointerEvent) => startTrackDrag(evt, index)"
+                @move-by="(delta: number) => moveTrackBy(index, delta)"
+              />
+              <ListviewItem
+                v-else
+                :item="item"
+                :data-listing-index="index"
+                :album-track-view="itemtype === 'albumtracks'"
+                :show-track-number="showTrackNumber"
+                :show-disc-number="showTrackNumber"
+                :show-duration="showDuration"
+                :show-favorite="showFavorite ?? showFavoritesOnlyFilter"
+                :show-menu="item.is_playable || isExternalItem(item)"
+                :show-provider="showProviderIcon"
+                :show-album="showAlbum"
+                :show-checkboxes="showCheckboxes && !isParentDirItem(item)"
+                :is-selected="isSelected(item)"
+                :is-available="itemIsAvailable(item)"
+                :is-playing="isPlaying(item, itemtype)"
+                :show-details="itemtype.includes('versions')"
+                :disable-play-button="isPlayActionInProgress"
+                :parent-item="parentItem"
+                :sort-by="props.sortListing ? undefined : params.sortBy"
+                :sort-field="displayedSort.sortField"
+                :sort-direction="displayedSort.sortDirection"
+                @select="onSelect"
+              />
+            </template>
+          </v-virtual-scroll>
+          <TrackTableDragGhost
+            v-if="draggedTrack && draggingIndex !== null"
+            :item="draggedTrack"
+            :index="draggingIndex"
+            :columns="trackRowColumns"
+            :count="draggedCount"
+            :top="ghostY"
+            :is-available="itemIsAvailable(draggedTrack)"
+            :parent-item="parentItem"
+          />
+        </div>
+      </v-infinite-scroll>
+
+      <!-- subtle message shown when there are no items to display -->
+      <Empty v-if="showEmptyState" class="border-none">
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <FilterX v-if="hasActiveFilters" />
+            <ListMusic v-else />
+          </EmptyMedia>
+          <EmptyTitle>{{ $t("no_content") }}</EmptyTitle>
+          <EmptyDescription v-if="emptyDescription">
+            {{ emptyDescription }}
+          </EmptyDescription>
+        </EmptyHeader>
+        <EmptyContent v-if="hasActiveFilters && params.search">
+          <Button variant="outline" size="sm" @click="redirectSearch">
+            {{ $t("try_global_search") }}
+          </Button>
+        </EmptyContent>
+        <EmptyContent
+          v-if="emptyStateProviderActions.length"
+          class="flex-row flex-wrap justify-center gap-2"
+        >
+          <Button
+            v-for="provider in emptyStateProviderActions"
+            :key="provider.value"
+            variant="outline"
+            size="sm"
+            @click="changeProviderFilter(provider.value)"
+          >
+            {{ $t("show_results_on", [provider.label]) }}
+          </Button>
+        </EmptyContent>
+      </Empty>
+
+      <AlphabetIndexBar
+        v-if="showLetterBar"
+        ref="letterBar"
+        :letters="indexLetters"
+        :current="currentLetter"
+        :jump="jumpToLetter"
+      />
+
+      <ListingSelectionBar
+        :open="selectedItems.length > 1"
+        :count="selectedItems.length"
+        :all-selected="allSelected"
+        @clear="clearSelection"
+        @select-all="selectAll"
+        @actions="
+          (anchor: { x: number; y: number }) =>
+            handleMenuBtnClick(
+              selectedItems,
+              anchor.x,
+              anchor.y,
+              parentItem,
+              true,
+              undefined,
+              displayedSort.sortField,
+              displayedSort.sortDirection,
+            )
+        "
+      />
+    </div>
+  </section>
+</template>
+
+<script lang="ts">
+export type {
+  LoadDataParams,
+  StoredState,
+  ToolBarTab,
+} from "@/composables/useItemsListing";
+</script>
+
+<script setup lang="ts">
+import type { Component } from "vue";
+
+import AlphabetIndexBar from "@/components/AlphabetIndexBar.vue";
+import GenreIcon from "@/components/icons/GenreIcon.vue";
+import ListViewSkeleton from "@/components/skeletons/ListViewSkeleton.vue";
+import PanelViewSkeleton from "@/components/skeletons/PanelViewSkeleton.vue";
+import { SMART_PLAYLIST_PROVIDER_DOMAIN } from "@/components/smart_playlist/constants";
+import Toolbar, { ToolBarMenuItem } from "@/components/Toolbar.vue";
+import TrackTableDragGhost from "@/components/track-table/TrackTableDragGhost.vue";
+import TrackTableHeader from "@/components/track-table/TrackTableHeader.vue";
+import TrackTableRow from "@/components/track-table/TrackTableRow.vue";
+import {
+  TRACK_ROW_HEIGHT,
+  type TrackColumn,
+} from "@/components/track-table/trackTableColumns";
+import LibrarySortControls from "@/components/LibrarySortControls.vue";
+import ListingSelectionBar from "@/components/ListingSelectionBar.vue";
+import ListingToolbarControls from "@/components/listing-toolbar/ListingToolbarControls.vue";
+import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import { InputGroupAddon, InputGroupButton } from "@/components/ui/input-group";
+import { SearchInput } from "@/components/ui/search-input";
+import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import GridSizeSlider from "@/components/GridSizeSlider.vue";
+import { useCommandCenter } from "@/composables/useCommandCenter";
+import { useItemsListing } from "@/composables/useItemsListing";
+import {
+  useLetterIndex,
+  type LoadLetterIndexFn,
+} from "@/composables/useLetterIndex";
+import {
+  ALBUM_TYPE_FILTER_KEYS,
+  useListingFilters,
+} from "@/composables/useListingFilters";
+import { useListingCount } from "@/composables/useListingCount";
+import { useListingSaves } from "@/composables/useListingSaves";
+import { useListingWindow } from "@/composables/useListingWindow";
+import { useTopListingRow } from "@/composables/useTopListingRow";
+import { useCurrentLetter } from "@/composables/useCurrentLetter";
+import { canSavePlaylistMoves } from "@/composables/usePlaylistTrackReorder";
+import { useTrackReorderRows } from "@/composables/useTrackReorderRows";
+import type {
+  LoadDataParams,
+  LoadPagedDataFn,
+  ToolBarTab,
+} from "@/composables/useItemsListing";
+import { useTrackTableColumns } from "@/composables/useTrackTableColumns";
+import { SEARCHABLE_MEDIA_TYPES } from "@/composables/useProgressiveSearch";
+import { useUserPreferences } from "@/composables/userPreferences";
+import {
+  keepOwnFavorite,
+  setFavoriteState,
+  subscribeOwnFavorites,
+} from "@/helpers/favorites";
+import { handleMenuBtnClick } from "@/helpers/media_item_actions";
+import { selectionRange } from "@/helpers/selection_range";
+import { listsPlaylistFromStart } from "@/helpers/playlist_reorder";
+import {
+  GRID_SIZE_DEFAULT,
+  gridColumns,
+  defaultShowActions,
+  normalizeGridSize,
+  PANEL_ACTIONS_MIN_WIDTH,
+} from "@/helpers/grid_size";
+import { activeFilterCount, clearedFilters } from "@/helpers/listing_filters";
+import { returnedByHistory } from "@/helpers/navigation";
+import { panelViewItemResponsive, scrollElement } from "@/helpers/utils";
+import { api } from "@/plugins/api";
+import {
+  isExternalItem,
+  itemIsAvailable,
+  itemSupportsPlayLog,
+  providerServiceName,
+} from "@/plugins/api/helpers";
+import {
+  ArtistType,
+  EventMessage,
+  EventType,
+  ItemMapping,
+  MediaItemTypeOrItemMapping,
+  MediaType,
+  PlaybackState,
+  PodcastEpisode,
+  ProviderFeature,
+  ProviderType,
+  SortDirection,
+  Radio,
+  SortField,
+  type Album,
+  type Genre,
+  type MediaItem,
+  type MediaItemType,
+  type ProviderInstance,
+  ListingType,
+  type Track,
+} from "@/plugins/api/interfaces";
+import { eventbus } from "@/plugins/eventbus";
+import { store } from "@/plugins/store";
+import {
+  CheckCheck,
+  ChevronDown,
+  ChevronUp,
+  Disc3,
+  Eye,
+  EyeClosed,
+  EyeOff,
+  Files,
+  FilterX,
+  Heart,
+  Layers,
+  LayoutGrid,
+  LayoutList,
+  LibraryBig,
+  ListChecks,
+  ListMusic,
+  MicVocal,
+  Package,
+  RefreshCw,
+  Search,
+  TriangleAlert,
+  X,
+} from "@lucide/vue";
+import {
+  computed,
+  markRaw,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  useTemplateRef,
+  watch,
+  watchEffect,
+} from "vue";
+import { unrefElement, useKeyModifier, useResizeObserver } from "@vueuse/core";
+import { useI18n } from "vue-i18n";
+import { useRoute, useRouter } from "vue-router";
+import { toast } from "vue-sonner";
+import ListviewItem from "./ListviewItem.vue";
+import PanelviewItem from "./PanelviewItem.vue";
+
+// properties
+export interface Props {
+  itemtype: string;
+  sortListing?: ListingType;
+  sortOptionExcludeFields?: SortField[];
+  showTrackNumber?: boolean;
+  showProvider?: boolean;
+  showAlbum?: boolean;
+  showFavoritesOnlyFilter?: boolean;
+  showFavorite?: boolean;
+  showDuration?: boolean;
+  parentItem?: MediaItemType;
+  showAlbumArtistsOnlyFilter?: boolean;
+  showSearchButton?: boolean;
+  showRefreshButton?: boolean;
+  showSelectButton?: boolean;
+  showAlbumTypeFilter?: boolean;
+  // the album types the album type filter offers (default: every type)
+  albumTypeFilterOptions?: string[];
+  // album types carried in by a link: selected instead of the saved filter on
+  // this visit. Nothing is saved until the user changes the album type filter.
+  albumTypeOverride?: string[];
+  showProviderFilter?: boolean;
+  showCollapseCollections?: boolean;
+  // when set, the provider filter allows only a single selection at a time
+  singleProviderFilter?: boolean;
+  // when set, the provider filter is a required single selector: exactly one
+  // provider is always selected (defaulting to the first available option) and
+  // it cannot be cleared to "all".
+  requireProviderSelection?: boolean;
+  // explicit list of provider instance_ids to offer in the provider filter.
+  // when set, it replaces the itemtype-derived list (and is not limited to
+  // music providers).
+  providerFilterOptions?: string[];
+  // when set, the explicit provider list above also offers the library, as its
+  // first option
+  libraryFilterOption?: boolean;
+  // the option a required selection starts on, when nothing valid is stored
+  // (default: the first one offered)
+  defaultProvider?: string;
+  // a provider carried in by a link: selected instead of the saved filter on
+  // this visit. Nothing is saved until the user picks a provider themselves,
+  // which may be this one.
+  providerOverride?: string;
+  updateAvailable?: boolean;
+  title?: string;
+  subtitle?: string;
+  hideOnEmpty?: boolean;
+  // a row of a detail page: on the page's gutter, under a section title
+  detailRow?: boolean;
+  // custom message shown when the listing has no items and no active filters
+  emptyMessage?: string;
+  // the listing is the whole view, so the empty state centres in the page height
+  fillHeight?: boolean;
+  showLibraryOnlyFilter?: boolean;
+  showGenreFilter?: boolean;
+  showHideEmptyFilter?: boolean;
+  showHideFullyPlayedFilter?: boolean;
+  allowCollapse?: boolean;
+  allowKeyHooks?: boolean;
+  extraMenuItems?: ToolBarMenuItem[];
+  // loadPagedData callback is provided for serverside paging/sorting
+  loadPagedData?: LoadPagedDataFn;
+  // loadLetterIndex callback gives a listing sorted by name its jump-to-letter bar
+  loadLetterIndex?: LoadLetterIndexFn;
+  limit?: number;
+  total?: number;
+  infiniteScroll?: boolean;
+  path?: string;
+  icon?: string | Component;
+  // makes the toolbar icon a button, e.g. a back arrow for a full-page listing
+  iconAction?: () => void;
+  restoreState?: boolean;
+  onTitleClick?: () => void;
+  refreshOnParentUpdate?: boolean;
+  forcedViewMode?: "list" | "panel";
+  // the cards start without their action buttons until the user picks
+  hideActionsByDefault?: boolean;
+  toolBarTabs?: ToolBarTab[];
+  // the list view shows tracks as a table with columns
+  trackTable?: boolean;
+  // the track table rows can be dragged to a new place in the parent playlist,
+  // while the listing shows the playlist's own order
+  reorderable?: boolean;
+  // search, sort, view and filters sit in the title bar, and the active
+  // filters show as chips below it
+  libraryToolbar?: boolean;
+  // the number of items beside the title, with the title bar controls
+  showCount?: boolean;
+}
+const props = withDefaults(defineProps<Props>(), {
+  sortListing: undefined,
+  sortOptionExcludeFields: () => [],
+  showTrackNumber: true,
+  showProvider: undefined,
+  showAlbum: true,
+  showFavoritesOnlyFilter: true,
+  showFavorite: undefined,
+  showDuration: true,
+  parentItem: undefined,
+  hideOnEmpty: false,
+  emptyMessage: undefined,
+  fillHeight: false,
+  showSearchButton: undefined,
+  showRefreshButton: undefined,
+  showSelectButton: undefined,
+  showAlbumTypeFilter: undefined,
+  albumTypeFilterOptions: () => ALBUM_TYPE_FILTER_KEYS,
+  albumTypeOverride: undefined,
+  showProviderFilter: undefined,
+  showCollapseCollections: undefined,
+  singleProviderFilter: false,
+  requireProviderSelection: false,
+  providerFilterOptions: undefined,
+  libraryFilterOption: false,
+  defaultProvider: undefined,
+  providerOverride: undefined,
+  allowCollapse: false,
+  allowKeyHooks: false,
+  limit: 50,
+  total: undefined,
+  infiniteScroll: true,
+  title: undefined,
+  subtitle: undefined,
+  showLibraryOnlyFilter: false,
+  showGenreFilter: false,
+  showHideEmptyFilter: false,
+  showHideFullyPlayedFilter: false,
+  extraMenuItems: undefined,
+  loadPagedData: undefined,
+  loadLetterIndex: undefined,
+  path: undefined,
+  icon: undefined,
+  iconAction: undefined,
+  restoreState: false,
+  onTitleClick: undefined,
+  refreshOnParentUpdate: false,
+  forcedViewMode: undefined,
+  hideActionsByDefault: false,
+  toolBarTabs: undefined,
+  trackTable: false,
+  reorderable: false,
+  libraryToolbar: false,
+  showCount: true,
+});
+
+const emit = defineEmits<{
+  // the provider selection whenever it is set: on start, from a restored
+  // visit, or by the user
+  "provider-change": [provider: string[] | undefined];
+}>();
+
+// global refs
+const router = useRouter();
+const route = useRoute();
+const { t, te } = useI18n();
+const { open: openCommandCenter } = useCommandCenter();
+const { getItemsListingPreferences, getPreference } = useUserPreferences();
+const { setItemsListingPreference, setItemsListingPreferences, holdRestore } =
+  useListingSaves(() => reconcileSavedSettings());
+
+const activeTabId = ref(props.toolBarTabs?.[0]?.id || "");
+let restoredFromPrevState = false;
+
+const getActiveTab = () => {
+  return props.toolBarTabs?.find((tab) => tab.id === activeTabId.value);
+};
+
+const {
+  allItemsReceived,
+  baseOffset,
+  displayedSort,
+  isDisposed,
+  librarySorting,
+  loadAllItems,
+  loadData,
+  loadError,
+  loadNextPage,
+  loadPreviousPage,
+  loadRow,
+  loading,
+  newContentAvailable,
+  pagedItems,
+  params,
+  reloadLoadedItems,
+  retryLoad,
+  serverSortOptions,
+  sortOptions,
+  sortOptionsLoaded,
+  tempHide,
+} = useItemsListing(props, getActiveTab);
+// the first load waits for the sort options; until then the scroller must not
+// load a page of its own
+const loadPending = computed(
+  () => loading.value || (!!props.sortListing && !sortOptionsLoaded.value),
+);
+// the desktop row of quick sorts keeps its height while the sort options load,
+// so the items do not shift; a listing without quick sorts has no row, and one
+// with the title bar controls sorts from there
+const showSortChipsRow = computed(
+  () =>
+    !!props.sortListing &&
+    !props.libraryToolbar &&
+    !store.mobileLayout &&
+    (!sortOptionsLoaded.value || librarySorting.quickOptions.value.length > 0),
+);
+
+watch(
+  () => props.toolBarTabs,
+  (tabs) => {
+    if (!tabs || tabs.length === 0) return;
+    if (tabs.some((tab) => tab.id === activeTabId.value)) return;
+    const hadActiveTab = activeTabId.value !== "";
+    const preferred = savedPrefs.value.activeTab;
+    const target = tabs.find((tab) => tab.id === preferred) ?? tabs[0];
+
+    activeTabId.value = target.id;
+
+    if (restoredFromPrevState) {
+      if (preferred && !tabs.some((tab) => tab.id === preferred)) {
+        loadData(true);
+      }
+    } else if (hadActiveTab || target.id !== tabs[0].id) {
+      loadData(true);
+    }
+  },
+);
+
+const onTabChange = function (tabId: string) {
+  if (!tabId || tabId === activeTabId.value) return;
+  activeTabId.value = tabId;
+
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "activeTab",
+    tabId,
+  );
+  loadData(true);
+};
+
+const viewMode = ref("list");
+const listContainer = ref<HTMLElement>();
+const showProviderIcon = computed(
+  () => props.showProvider ?? Object.keys(api.providers).length > 1,
+);
+const showTrackTable = computed(
+  () => props.trackTable && viewMode.value == "list",
+);
+const {
+  enabledColumns: enabledTrackColumns,
+  visibleColumns: trackColumns,
+  setEnabledColumns: setEnabledTrackColumns,
+} = useTrackTableColumns(() =>
+  props.trackTable ? listContainer.value : undefined,
+);
+const gridSize = ref(GRID_SIZE_DEFAULT);
+const showGridActions = ref(true);
+const supportsGridActions = computed(() =>
+  ["tracks", "albums", "albumtracks", "artists", "genres"].includes(
+    props.itemtype,
+  ),
+);
+const showSearch = ref(false);
+const searchHasFocus = ref(false);
+const searchInputRef = ref<InstanceType<typeof SearchInput>>();
+const listingMediaType = computed(() => MEDIA_TYPE_BY_ITEMTYPE[props.itemtype]);
+const searchLabel = computed(() => {
+  const mediaType = listingMediaType.value;
+  if (!mediaType) return t("search");
+  const labelKey = MEDIA_TYPE_LABEL_KEYS[mediaType] ?? `${mediaType}s`;
+  return t("search_in", [t(labelKey)]);
+});
+const selectedItems = ref<MediaItemTypeOrItemMapping[]>([]);
+const showCheckboxes = ref(false);
+const expanded = ref(true);
+const genreOptions = ref<{ label: string; value: number }[]>([]);
+
+// below this item count, the per-listing search option is hidden to reduce
+// clutter (consumers can force it on/off via the showSearchButton prop).
+const SEARCH_ITEM_THRESHOLD = 25;
+
+const MEDIA_TYPE_BY_ITEMTYPE: Record<string, MediaType> = {
+  artists: MediaType.ARTIST,
+  similarartists: MediaType.ARTIST,
+  albums: MediaType.ALBUM,
+  albumversions: MediaType.ALBUM,
+  artistalbums: MediaType.ALBUM,
+  trackalbums: MediaType.ALBUM,
+  tracks: MediaType.TRACK,
+  albumtracks: MediaType.TRACK,
+  artisttracks: MediaType.TRACK,
+  playlisttracks: MediaType.TRACK,
+  similartracks: MediaType.TRACK,
+  trackversions: MediaType.TRACK,
+  playlists: MediaType.PLAYLIST,
+  audiobooks: MediaType.AUDIOBOOK,
+  artistaudiobooks: MediaType.AUDIOBOOK,
+  podcasts: MediaType.PODCAST,
+  podcastepisodes: MediaType.PODCAST_EPISODE,
+  radios: MediaType.RADIO,
+  radioversions: MediaType.RADIO,
+  genres: MediaType.GENRE,
+};
+
+const MEDIA_TYPE_LABEL_KEYS: Partial<Record<MediaType, string>> = {
+  [MediaType.PODCAST_EPISODE]: "podcast_episodes",
+};
+
+interface DiscHeader {
+  isDiscHeader: true;
+  disc: number;
+}
+
+const discNumber = (i: MediaItemType) =>
+  "disc_number" in i ? i.disc_number : undefined;
+
+// for multi-disc albums (in default track order), insert a "Disc X" header
+// before the first track of each disc.
+const listDisplayItems = computed<(MediaItemType | DiscHeader)[]>(() => {
+  const multiDisc =
+    props.itemtype === "albumtracks" &&
+    pagedItems.value.some((i) => (discNumber(i) ?? 0) > 1);
+  const isTrackNumberAscending =
+    displayedSort.value.sortField === SortField.TRACK_NUMBER &&
+    displayedSort.value.sortDirection === SortDirection.ASC;
+  if (!multiDisc || !isTrackNumberAscending) {
+    return pagedItems.value;
+  }
+  const result: (MediaItemType | DiscHeader)[] = [];
+  let lastDisc: number | undefined;
+  for (const item of pagedItems.value) {
+    const disc = discNumber(item);
+    if (disc && disc !== lastDisc) {
+      result.push({ isDiscHeader: true, disc });
+      lastDisc = disc;
+    }
+    result.push(item);
+  }
+  return result;
+});
+
+// methods
+const applyQueryGenreFilter = function () {
+  const queryGenre = route.query.genre_id ?? route.query.genre_ids;
+  const parsedIds: number[] = [];
+  const parseValue = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    for (const part of trimmed.split(",")) {
+      const parsed = Number(part.trim());
+      if (!Number.isNaN(parsed)) parsedIds.push(parsed);
+    }
+  };
+
+  if (Array.isArray(queryGenre)) {
+    for (const value of queryGenre) {
+      if (typeof value !== "string") continue;
+      parseValue(value);
+    }
+  } else if (typeof queryGenre === "string") {
+    parseValue(queryGenre);
+  }
+  const nextGenreIds = parsedIds.length === 0 ? undefined : parsedIds;
+  const changed =
+    JSON.stringify(params.value.genreIds) !== JSON.stringify(nextGenreIds);
+  params.value.genreIds = nextGenreIds;
+  return changed;
+};
+const closeSearch = function () {
+  params.value.search = "";
+  showSearch.value = false;
+};
+const focusSearch = function () {
+  nextTick(() => {
+    searchInputRef.value?.focus();
+  });
+};
+const toggleSearch = function () {
+  if (showSearch.value) {
+    closeSearch();
+  } else {
+    showSearch.value = true;
+    focusSearch();
+  }
+};
+
+const toggleExpand = function () {
+  // If a custom title click handler is provided, use it
+  if (props.onTitleClick) {
+    props.onTitleClick();
+    return;
+  }
+
+  // Otherwise, use the default expand/collapse behavior
+  // the open and collapsed states each draw their own expand button, so the
+  // keyboard focus moves on to the button that replaces the pressed one
+  const expandButton = `button[aria-label=${JSON.stringify(t("tooltip.collapse_expand"))}]`;
+  const active = document.activeElement;
+  const hadFocus =
+    !!active?.matches(expandButton) && !!sectionEl.value?.contains(active);
+  expanded.value = !expanded.value;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "expand",
+    expanded.value,
+  );
+  if (hadFocus) {
+    nextTick(() =>
+      sectionEl.value?.querySelector<HTMLElement>(expandButton)?.focus(),
+    );
+  }
+};
+
+const selectViewMode = function (newMode: string) {
+  viewMode.value = newMode;
+  if (!props.forcedViewMode) {
+    setItemsListingPreference(
+      props.path || props.itemtype,
+      props.itemtype,
+      "viewMode",
+      newMode,
+    );
+  }
+};
+
+// follows resizes: the breakpoints it looks up are reactive
+const gridColumnCount = computed(() =>
+  gridColumns(panelViewItemResponsive(0), gridSize.value),
+);
+
+const INFINITE_SCROLL_MARGIN = 600;
+
+// the letter index is opt-in: without the preference it is never requested
+const showLetterIndex = getPreference("show_letter_index", false);
+const letterIndexLoader = computed(() =>
+  showLetterIndex.value ? props.loadLetterIndex : undefined,
+);
+const {
+  entries: letterEntries,
+  letters: indexLetters,
+  load: reloadLetterIndex,
+  rowFor,
+  letterAt,
+} = useLetterIndex(() => letterIndexLoader.value, params);
+// the mobile search row sits where the bar starts, so the bar waits for it
+const showLetterBar = computed(
+  () =>
+    letterEntries.value.length > 1 &&
+    pagedItems.value.length > 0 &&
+    !(showSearchInput.value && store.mobileLayout),
+);
+const scroller = () => document.querySelector<HTMLElement>(".content-section");
+// the rendered element of the loaded item at this index
+const rowElement = function (index: number) {
+  // the list view's rows include its disc headers
+  const position =
+    viewMode.value === "list"
+      ? listDisplayItems.value.indexOf(pagedItems.value[index])
+      : index;
+  return (
+    listContainer.value?.querySelector<HTMLElement>(
+      `[data-listing-index="${position}"]`,
+    ) ?? null
+  );
+};
+
+const { topIndex } = useTopListingRow(scroller, listContainer, showLetterBar);
+const letterBar =
+  useTemplateRef<InstanceType<typeof AlphabetIndexBar>>("letterBar");
+const { currentLetter, markJump } = useCurrentLetter({
+  scroller,
+  bar: () => letterBar.value?.$el as HTMLElement | undefined,
+  rowElement,
+  baseOffset,
+  topIndex,
+  letterAt,
+  entries: letterEntries,
+});
+// changes to the library move the letters' rows
+watch(newContentAvailable, (available) => {
+  if (available) reloadLetterIndex();
+});
+
+const topSentinel = useTemplateRef<HTMLElement>("topSentinel");
+const { jumpToRow, loadAllAbove } = useListingWindow({
+  scroller,
+  topSentinel,
+  rowElement,
+  margin: INFINITE_SCROLL_MARGIN,
+  listing: { baseOffset, loading, isDisposed, loadRow, loadPreviousPage },
+});
+
+const jumpToLetter = async function (label: string) {
+  const row = rowFor(label);
+  if (row === undefined) return;
+  markJump(row);
+  const failed = loadError.value;
+  await jumpToRow(row);
+  // rows loaded after a failed page let the scroller page on again
+  if (failed && !loadError.value && !tempHide.value) {
+    infiniteScrollEl.value?.reset();
+  }
+};
+
+const commitGridSize = function (size: number) {
+  gridSize.value = size;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "gridSize",
+    size,
+  );
+};
+
+const sectionEl = useTemplateRef("sectionEl");
+// the cards hide their action row when the covers get too small for it
+const panelRow = useTemplateRef("panelRow");
+const gridActionsFit = ref(true);
+const updateGridActionsFit = () => {
+  const width = unrefElement(panelRow)
+    ?.querySelector(".ed-card__art")
+    ?.getBoundingClientRect().width;
+  gridActionsFit.value = !width || width >= PANEL_ACTIONS_MIN_WIDTH;
+};
+useResizeObserver(panelRow, updateGridActionsFit);
+watch(gridColumnCount, updateGridActionsFit, { flush: "post" });
+
+// The desktop menu snapshots its items; keep the control's props live.
+const gridControlProps = reactive({
+  size: gridSize,
+  showActions: showGridActions,
+  actionsFit: gridActionsFit,
+  supportsActions: supportsGridActions,
+  onChange: (size: number) => {
+    gridSize.value = size;
+  },
+  onCommit: commitGridSize,
+  onToggleActions: (show: boolean) => {
+    showGridActions.value = show;
+    setItemsListingPreference(
+      props.path || props.itemtype,
+      props.itemtype,
+      "showActions",
+      show,
+    );
+  },
+});
+
+watch(
+  () => props.forcedViewMode,
+  (newMode) => {
+    if (newMode) viewMode.value = newMode;
+  },
+);
+
+const toggleFavoriteFilter = function () {
+  params.value.favoritesOnly = !params.value.favoritesOnly;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "favoriteFilter",
+    params.value.favoritesOnly,
+  );
+  loadData(undefined, undefined, true);
+};
+
+const toggleHideFullyPlayedFilter = function () {
+  params.value.hideFullyPlayed = !params.value.hideFullyPlayed;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "hideFullyPlayedFilter",
+    params.value.hideFullyPlayed,
+  );
+  loadData(undefined, undefined, true);
+};
+
+const toggleLibraryOnlyFilter = function () {
+  params.value.libraryOnly = !params.value.libraryOnly;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "libraryFilter",
+    params.value.libraryOnly,
+  );
+  loadData(true, undefined, true);
+};
+
+const toggleAlbumArtistsFilter = function () {
+  params.value.albumArtistsFilter = !params.value.albumArtistsFilter;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "albumArtistsFilter",
+    params.value.albumArtistsFilter,
+  );
+  loadData(undefined, undefined, true);
+};
+
+const toggleCollapseCollections = function () {
+  params.value.collapseCollections = !params.value.collapseCollections;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "collapseCollections",
+    params.value.collapseCollections,
+  );
+  loadData(true, undefined, true);
+};
+
+const toggleHideEmptyFilter = function () {
+  const current = params.value.hideEmptyFilter;
+  // cycle: undefined/false (all) → true (hide empty) → null (defaults only) → false (all)
+  if (current === true) {
+    setHideEmptyFilter(null);
+  } else if (current === null) {
+    setHideEmptyFilter(false);
+  } else {
+    setHideEmptyFilter(true);
+  }
+};
+
+const setHideEmptyFilter = function (hideEmpty: boolean | null) {
+  params.value.hideEmptyFilter = hideEmpty;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "hideEmptyFilter",
+    params.value.hideEmptyFilter,
+  );
+  loadData(undefined, undefined, true);
+};
+
+const toggleGenreFilter = function (genreId: number) {
+  // normalize current ids to an array
+  const current = params.value.genreIds;
+  let ids: number[] = [];
+  if (Array.isArray(current)) {
+    ids = [...current];
+  } else if (typeof current === "number") {
+    ids = [current];
+  }
+
+  if (ids.includes(genreId)) {
+    ids = ids.filter((id) => id !== genreId);
+  } else {
+    ids.push(genreId);
+  }
+  setGenreFilter(ids);
+};
+
+// the whole genre selection at once, with a single reload
+const setGenreFilter = function (ids: number[]) {
+  if (ids.length === 0) {
+    params.value.genreIds = undefined;
+  } else {
+    params.value.genreIds = ids;
+  }
+
+  // keep URL in sync so back/refresh preserves filters
+  const query = { ...route.query };
+  if (ids.length) {
+    query.genre_ids = ids.join(",");
+  }
+  // Always remove legacy single-genre param so we have a single source of truth
+  if (!ids.length) {
+    delete query.genre_ids;
+  }
+  delete query.genre_id;
+  router.replace({ query });
+
+  // reload with updated filters
+  loadData(true, undefined, true);
+};
+
+const isSelected = function (item: MediaItemTypeOrItemMapping) {
+  return selectedItems.value.includes(item);
+};
+
+const isParentDirItem = function (item: MediaItemTypeOrItemMapping) {
+  // the parent directory ("..") link injected in browse listings
+  // must never be selectable as it breaks the action/context menu
+  return item.media_type == MediaType.FOLDER && item.name == "..";
+};
+
+const isPlaying = function (item: MediaItemType, itemtype: string): boolean {
+  if (store.activePlayer?.playback_state != PlaybackState.PLAYING) return false;
+  const current = store.curQueueItem?.media_item as
+    Track | Radio | PodcastEpisode | undefined;
+  if (!current) return false;
+  switch (itemtype) {
+    case "tracks":
+    case "playlisttracks":
+    case "albumtracks":
+    case "artisttracks": {
+      return item.item_id === current.item_id;
+    }
+    case "albums": {
+      if (!("album" in current) || !current.album) return false;
+      return item.item_id === current.album.item_id;
+    }
+    case "artists": {
+      if (!("artists" in current) || !current.artists) return false;
+      return (
+        Array.isArray(current.artists) &&
+        current.artists.some(
+          (artist) => artist && artist.item_id === item.item_id,
+        )
+      );
+    }
+    case "radios": {
+      return item.item_id === current.item_id;
+    }
+    case "podcasts": {
+      if (!("podcast" in current) || !current.podcast) return false;
+      return item.item_id === current.podcast.item_id;
+    }
+    case "podcastepisodes": {
+      return item.item_id === current.item_id;
+    }
+    default: {
+      return false;
+    }
+  }
+};
+
+let selectionAnchor: MediaItemTypeOrItemMapping | undefined;
+const shiftHeld = useKeyModifier("Shift");
+// a shift-click would otherwise also select the text of the rows in between
+const shiftSelecting = computed(
+  () => showCheckboxes.value && !!shiftHeld.value,
+);
+
+const setSelected = function (
+  item: MediaItemTypeOrItemMapping,
+  selected: boolean,
+) {
+  if (selected) {
+    if (isParentDirItem(item)) return;
+    if (!selectedItems.value.includes(item)) selectedItems.value.push(item);
+  } else {
+    for (let i = 0; i < selectedItems.value.length; i++) {
+      if (selectedItems.value[i] === item) {
+        selectedItems.value.splice(i, 1);
+      }
+    }
+  }
+};
+
+const onSelect = function (
+  item: MediaItemTypeOrItemMapping,
+  selected: boolean,
+) {
+  const range = shiftHeld.value
+    ? selectionRange<MediaItemTypeOrItemMapping>(
+        pagedItems.value,
+        selectionAnchor,
+        item,
+      )
+    : [item];
+  selectionAnchor = item;
+  if (range.length === 1) {
+    setSelected(item, selected);
+    return;
+  }
+  // a range can hold every loaded row, so the selection is rebuilt in one
+  // pass; it joins the selection in listing order, whichever way it ran
+  const inRange = new Set(range);
+  const kept = selectedItems.value.filter(
+    (selectedItem) => !inRange.has(selectedItem),
+  );
+  selectedItems.value = selected
+    ? [...kept, ...range.filter((rangeItem) => !isParentDirItem(rangeItem))]
+    : kept;
+};
+
+const toggleCheckboxes = function () {
+  if (showCheckboxes.value) {
+    // clear selection
+    selectedItems.value = [];
+    selectionAnchor = undefined;
+  }
+  showCheckboxes.value = !showCheckboxes.value;
+};
+
+const onRefreshClicked = function () {
+  loadData(true, true);
+  reloadLetterIndex();
+};
+
+watch(sortOptions, () => {
+  if (!sortOptionsLoaded.value || !props.sortListing) return;
+  const normalized = librarySorting.normalizeSortBy(params.value.sortBy);
+  if (normalized === params.value.sortBy) return;
+  params.value.sortBy = normalized;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "sortBy",
+    normalized,
+  );
+  loadData(true, undefined, true);
+});
+
+const changeSort = function (sort_key?: string) {
+  if (sort_key !== undefined) {
+    params.value.sortBy = sort_key;
+  }
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "sortBy",
+    params.value.sortBy,
+  );
+  loadData(undefined, undefined, true);
+};
+
+const changeAlbumTypeFilter = function (albumType: string) {
+  const current = params.value.albumType ?? [];
+  setAlbumTypeFilter(
+    current.includes(albumType)
+      ? current.filter((type) => type !== albumType)
+      : [...current, albumType],
+  );
+};
+
+// the whole album type selection at once, with a single save and reload
+const setAlbumTypeFilter = function (albumTypes: string[]) {
+  params.value.albumType = albumTypes;
+  // the user's own pick is what gets saved and shown from here on
+  carriedAlbumTypes = undefined;
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "albumType",
+    params.value.albumType,
+  );
+  loadData(undefined, undefined, true);
+};
+
+// the provider carried in by a link, kept until the user picks a provider
+// themselves: every preference write hands the listing its saved settings
+// again, and this keeps the carried one in front of the saved filter across
+// those. One that is not offered here is ignored.
+let carriedProvider = props.providerOverride;
+const offeredCarriedProvider = () =>
+  carriedProvider !== undefined &&
+  musicProviders.value.some((provider) => provider.value === carriedProvider)
+    ? carriedProvider
+    : undefined;
+
+// the album types carried in by a link, kept until the user changes the album
+// type filter, the same way as the carried provider. Those not offered here
+// are ignored.
+let carriedAlbumTypes = props.albumTypeOverride;
+const offeredCarriedAlbumTypes = () => {
+  if (props.showAlbumTypeFilter !== true || !carriedAlbumTypes) return;
+  const offered = carriedAlbumTypes.filter((type) =>
+    props.albumTypeFilterOptions.includes(type),
+  );
+  return offered.length ? offered : undefined;
+};
+
+const carriesFilters = () =>
+  offeredCarriedProvider() !== undefined ||
+  offeredCarriedAlbumTypes() !== undefined;
+
+// a cached visit that was on a carried-in filter is only returned to by
+// going back; reached any other way, the listing starts over on the saved
+// filter, or on what is carried in now
+const cachedVisitApplies = () =>
+  !store.prevState?.carried || carriesFilters() || returnedByHistory(router);
+
+const changeProviderFilter = function (providerId: string) {
+  if (props.requireProviderSelection) {
+    // required selector: always keep exactly one provider selected, so
+    // clicking the active provider cannot clear it to "all". It pins the
+    // provider carried in by a link, which is already on screen, and is a
+    // no-op otherwise.
+    if (params.value.provider?.[0] === providerId) {
+      if (offeredCarriedProvider() !== providerId) return;
+      carriedProvider = undefined;
+      saveProviderFilter();
+      return;
+    }
+    params.value.provider = [providerId];
+  } else if (props.singleProviderFilter) {
+    // single-select: clicking the active provider clears it, otherwise it
+    // replaces the current selection.
+    params.value.provider = params.value.provider?.includes(providerId)
+      ? undefined
+      : [providerId];
+  } else if (params.value.provider?.includes(providerId)) {
+    params.value.provider = params.value.provider?.filter(
+      (id) => id !== providerId,
+    );
+  } else {
+    params.value.provider = params.value.provider || [];
+    params.value.provider.push(providerId);
+  }
+  // If the array is empty, set to undefined (show all)
+  if (params.value.provider?.length === 0) {
+    params.value.provider = undefined;
+  }
+  // the user's own pick is what gets saved and shown from here on
+  carriedProvider = undefined;
+  saveProviderFilter();
+  loadData(true, undefined, true);
+};
+
+const saveProviderFilter = () =>
+  setItemsListingPreference(
+    props.path || props.itemtype,
+    props.itemtype,
+    "providerFilter",
+    params.value.provider,
+  );
+
+const showEmptyState = computed(
+  () => !loadPending.value && !loadError.value && pagedItems.value.length == 0,
+);
+
+const firstLoadFailed = computed(
+  () => loadError.value && !loading.value && pagedItems.value.length === 0,
+);
+
+const fillsHeight = computed(
+  () => props.fillHeight && (showEmptyState.value || firstLoadFailed.value),
+);
+
+const emptyDescription = computed(() =>
+  hasActiveFilters.value ? t("no_content_filter_hint") : props.emptyMessage,
+);
+
+// a listing scoped to the library (its own "library" option selected) that comes
+// up empty gives no hint that a provider's catalog is one filter switch away —
+// the artist album/singles "See all" is the case. Offer those sources as
+// one-tap buttons in the empty state; other listings never select "library" so
+// they never show them.
+const emptyStateProviderActions = computed(() => {
+  if (!props.libraryFilterOption) return [];
+  if (params.value.provider?.[0] !== "library") return [];
+  return musicProviders.value.filter(
+    (provider) => provider.value !== "library",
+  );
+});
+
+// the provider list shown by both the provider filter and the provider selector
+const providerFilterSubItems = () =>
+  musicProviders.value.map((provider) => ({
+    label: provider.label,
+    selected: params.value.provider?.includes(provider.value),
+    action: () => {
+      changeProviderFilter(provider.value);
+    },
+  }));
+
+const redirectSearch = function () {
+  const mediaType = listingMediaType.value;
+  openCommandCenter({
+    query: params.value.search,
+    mediaTypes:
+      mediaType && SEARCHABLE_MEDIA_TYPES.includes(mediaType)
+        ? [mediaType]
+        : [],
+  });
+};
+
+// computed properties
+const isSearchActive = computed(() => {
+  let searchActive = false;
+  if (params.value.search && params.value.search.length !== 0) {
+    searchActive = true;
+  }
+  return searchActive;
+});
+
+// true when the listing has been narrowed by any user-controllable filter
+// (search, favorites, provider, genre, album-type, ...). Used to keep an
+// otherwise hidden-on-empty listing visible — and to explain an empty result —
+// whenever the emptiness might be caused by filtering rather than missing data.
+const hasActiveFilters = computed(() => {
+  const p = params.value;
+  const genreActive = Array.isArray(p.genreIds)
+    ? p.genreIds.length > 0
+    : p.genreIds !== undefined;
+  return Boolean(
+    (p.search && p.search.length > 0) ||
+    p.favoritesOnly ||
+    p.libraryOnly ||
+    p.albumArtistsFilter ||
+    (props.showCollapseCollections && p.collapseCollections) ||
+    p.hideFullyPlayed ||
+    // a required selector always has a provider chosen — that is not a "filter"
+    (!props.requireProviderSelection && p.provider && p.provider.length > 0) ||
+    (p.albumType && p.albumType.length > 0) ||
+    genreActive ||
+    // hide-empty genres filter: true (hide empty) and null (defaults only)
+    // both narrow the result; false/undefined means "show all"
+    p.hideEmptyFilter === true ||
+    p.hideEmptyFilter === null,
+  );
+});
+
+const canDragTracks = computed(
+  () =>
+    props.reorderable &&
+    showTrackTable.value &&
+    displayedSort.value.sortField === SortField.POSITION &&
+    displayedSort.value.sortDirection !== SortDirection.DESC &&
+    !hasActiveFilters.value &&
+    // a move made while reconnecting could not be saved nor read back
+    canSavePlaylistMoves() &&
+    listsPlaylistFromStart(pagedItems.value),
+);
+const trackRowColumns = computed<TrackColumn[]>(() =>
+  canDragTracks.value ? ["handle", ...trackColumns.value] : trackColumns.value,
+);
+const listRowsEl = ref<HTMLElement | null>(null);
+const infiniteScrollEl = ref<{ reset: () => void } | null>(null);
+// a reload that finds the listing grew past its end pages on again; a load
+// that starts over re-creates the scroller instead
+watch(allItemsReceived, (received, wasReceived) => {
+  if (wasReceived && !received && !tempHide.value) {
+    infiniteScrollEl.value?.reset();
+  }
+});
+const {
+  startDrag: startTrackDrag,
+  moveBy: moveTrackBy,
+  refresh: refreshTrackRows,
+  saving: reorderSaving,
+  draggingIndex,
+  isDragging,
+  ghostY,
+  draggedTrack,
+  draggedCount,
+  rowDragStyle: trackRowDragStyle,
+  rowDragClass: trackRowDragClass,
+} = useTrackReorderRows({
+  listEl: listRowsEl,
+  items: pagedItems,
+  // albums re-read their rows the same way, but only a playlist's edits are held
+  playlistId: () =>
+    props.parentItem?.media_type === MediaType.PLAYLIST
+      ? props.parentItem.item_id
+      : undefined,
+  inOwnOrder: () => canDragTracks.value,
+  selected: selectedItems,
+  selecting: () => showCheckboxes.value,
+  rowHeight: TRACK_ROW_HEIGHT,
+  reload: async () => {
+    const failed = loadError.value;
+    await reloadLoadedItems();
+    // rows read again after a failed page let the scroller page on again
+    if (failed && !loadError.value && !tempHide.value) {
+      infiniteScrollEl.value?.reset();
+    }
+  },
+});
+
+// Server-paged listings only know their total when the parent passes it. An
+// unfiltered listing that is loaded to its end, or holds less than a page,
+// counts what it holds: a small listing then keeps search hidden while it
+// (re)loads.
+const totalItemCount = computed(() => {
+  if (props.total !== undefined) return props.total;
+  if (
+    !hasActiveFilters.value &&
+    (allItemsReceived.value || pagedItems.value.length < props.limit)
+  ) {
+    return baseOffset.value + pagedItems.value.length;
+  }
+  // server-paged without a known total: assume large enough to warrant search
+  return Number.POSITIVE_INFINITY;
+});
+
+// whether the search option is offered. An explicit showSearchButton wins;
+// otherwise search is auto-hidden for small listings to reduce clutter, but
+// kept available while a search is actually in progress.
+const searchAvailable = computed(() => {
+  if (props.showSearchButton === true) return true;
+  if (props.showSearchButton === false) return false;
+  return (
+    isSearchActive.value ||
+    showSearch.value ||
+    totalItemCount.value >= SEARCH_ITEM_THRESHOLD
+  );
+});
+
+const showSearchInput = computed(() => {
+  return searchAvailable.value && showSearch.value && expanded.value;
+});
+
+// the field stays on screen while it closes, and its icon waits for it to go
+const searchSlotShown = ref(false);
+const searchButtonRef = ref<InstanceType<typeof Button>>();
+// focus was in the field as it closed, so it goes to the icon that replaces it
+let refocusSearchButton = false;
+
+const onSearchSlotLeave = (el: Element) => {
+  refocusSearchButton = el.contains(document.activeElement);
+};
+const onSearchSlotLeft = () => {
+  searchSlotShown.value = false;
+  if (!refocusSearchButton) return;
+  refocusSearchButton = false;
+  nextTick(() =>
+    (searchButtonRef.value?.$el as HTMLElement | undefined)?.focus(),
+  );
+};
+
+// a phone drops the inline field without letting it finish closing
+watch(
+  () => store.mobileLayout,
+  (mobile) => {
+    if (mobile) searchSlotShown.value = false;
+  },
+);
+
+const searchButtonCloses = computed(
+  () => showSearchInput.value && !store.mobileLayout,
+);
+
+const isLibraryItem = computed(() => {
+  const libraryItemTypes = [
+    "artists",
+    "albums",
+    "tracks",
+    "playlists",
+    "audiobooks",
+    "podcasts",
+    "radios",
+    "genres",
+  ];
+
+  return libraryItemTypes.includes(props.itemtype);
+});
+
+const isPlayActionInProgress = computed(() => {
+  if (!store.activePlayerQueue) return false;
+  return (
+    store.activePlayerQueue.extra_attributes?.play_action_in_progress === true
+  );
+});
+
+const musicProviders = computed(() => {
+  // explicit provider list supplied by the parent: resolve the given
+  // instance_ids to labels as-is, without any itemtype/type filtering.
+  if (props.providerFilterOptions) {
+    const instances = props.providerFilterOptions
+      .map((instanceId) => api.providers[instanceId])
+      .filter((provider) => provider !== undefined);
+    // accounts of one service listed side by side keep their own names
+    const sharesDomain = (provider: ProviderInstance) =>
+      instances.filter((other) => other.domain === provider.domain).length > 1;
+    const providers = instances
+      .map((provider) => ({
+        label: sharesDomain(provider)
+          ? provider.name
+          : providerServiceName(provider),
+        value: provider.instance_id,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    if (!props.libraryFilterOption) return providers;
+    // the library is not a provider instance: the listing callback is handed "library"
+    return [{ label: t("source_library"), value: "library" }, ...providers];
+  }
+
+  // Map itemtype to the ProviderFeatures that mark a provider as a possible
+  // source of that mediatype. This is intentionally broader than the
+  // LIBRARY_* (sync) features: a provider without a syncable library can still
+  // contribute items to the library by being browsed/searched and favorited
+  // (e.g. catalog providers exposing an artist's albums/tracks).
+  const featureMap: Record<string, ProviderFeature[]> = {
+    artists: [
+      ProviderFeature.LIBRARY_ARTISTS,
+      ProviderFeature.ARTIST_ALBUMS,
+      ProviderFeature.ARTIST_TOPALBUMS,
+      ProviderFeature.ARTIST_TRACKS,
+      ProviderFeature.ARTIST_TOPTRACKS,
+    ],
+    albums: [
+      ProviderFeature.LIBRARY_ALBUMS,
+      ProviderFeature.ARTIST_ALBUMS,
+      ProviderFeature.ARTIST_TOPALBUMS,
+    ],
+    tracks: [
+      ProviderFeature.LIBRARY_TRACKS,
+      ProviderFeature.ARTIST_TRACKS,
+      ProviderFeature.ARTIST_TOPTRACKS,
+    ],
+    artisttracks: [
+      ProviderFeature.ARTIST_TRACKS,
+      ProviderFeature.ARTIST_TOPTRACKS,
+      ProviderFeature.LIBRARY_TRACKS,
+    ],
+    playlists: [ProviderFeature.LIBRARY_PLAYLISTS],
+    radios: [ProviderFeature.LIBRARY_RADIOS],
+    podcasts: [ProviderFeature.LIBRARY_PODCASTS],
+    audiobooks: [ProviderFeature.LIBRARY_AUDIOBOOKS],
+    genres: [ProviderFeature.LIBRARY_GENRES],
+  };
+
+  const requiredFeatures = featureMap[props.itemtype];
+
+  return Object.values(api.providers)
+    .filter((provider) => {
+      // include Smart Playlist plugin provider in the playlists filter
+      if (
+        props.itemtype === "playlists" &&
+        provider.domain === SMART_PLAYLIST_PROVIDER_DOMAIN
+      ) {
+        return provider.available;
+      }
+      if (provider.type !== ProviderType.MUSIC) return false;
+      // audiobook providers offer artists as authors/narrators only
+      if (
+        props.itemtype === "artists" &&
+        !provider.supported_artist_types.includes(ArtistType.SINGER)
+      ) {
+        return false;
+      }
+      // If we have required feature(s) for this itemtype, filter by them
+      if (requiredFeatures) {
+        return requiredFeatures.some((feature) =>
+          provider.supported_features.includes(feature),
+        );
+      }
+      // Otherwise, include all music providers
+      return true;
+    })
+    .map((provider) => ({
+      label: provider.name,
+      value: provider.instance_id,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+});
+
+// whether the provider filter is offered. An explicit showProviderFilter wins;
+// otherwise (like the search button) it is shown by default whenever the parent
+// supplies a curated provider list and more than one provider can contribute.
+const providerFilterAvailable = computed(() => {
+  if (props.showProviderFilter === false) return false;
+  if (musicProviders.value.length <= 1) return false;
+  if (props.showProviderFilter === true) return true;
+  return props.providerFilterOptions !== undefined;
+});
+
+// only one provider can be active at a time in both single-select and the
+// stricter required-selection mode.
+const singleProviderSelect = computed(
+  () => props.singleProviderFilter || props.requireProviderSelection,
+);
+
+// the sources the Filters panel offers, each marked by its icon: a required
+// pick of one, or a narrowing to any of them
+const sourceFilterOptions = computed(() => {
+  if (props.showProviderFilter === false) return [];
+  // a source picked while there were more stays on offer, and clearable,
+  // once it is the only one left; a required pick of the only one is no choice
+  if (
+    !providerFilterAvailable.value &&
+    (props.requireProviderSelection || !params.value.provider?.length)
+  ) {
+    return [];
+  }
+  return musicProviders.value.map((provider) => ({
+    ...provider,
+    domain: api.providers[provider.value]?.domain,
+    icon: provider.value === "library" ? LibraryBig : undefined,
+  }));
+});
+
+const listingFilters = useListingFilters(
+  props,
+  { params, genreOptions, providerOptions: sourceFilterOptions },
+  {
+    toggleFavorites: toggleFavoriteFilter,
+    toggleAlbumArtists: toggleAlbumArtistsFilter,
+    toggleLibraryOnly: toggleLibraryOnlyFilter,
+    toggleHideFullyPlayed: toggleHideFullyPlayedFilter,
+    toggleCollapseCollections: toggleCollapseCollections,
+    setHideEmpty: setHideEmptyFilter,
+    toggleGenre: toggleGenreFilter,
+    setGenres: setGenreFilter,
+    toggleAlbumType: changeAlbumTypeFilter,
+    setAlbumTypes: setAlbumTypeFilter,
+    toggleProvider: changeProviderFilter,
+  },
+);
+
+const activeFilters = computed(() => activeFilterCount(listingFilters.value));
+
+// turns every filter the panel offers back off, with a single save and reload
+const clearFilters = function () {
+  const offered = new Set(listingFilters.value.map((filter) => filter.id));
+  const p = params.value;
+  const cleared = clearedFilters(offered);
+  Object.assign(p, cleared.params);
+  if (offered.has("provider")) carriedProvider = undefined;
+  if (offered.has("album_type")) carriedAlbumTypes = undefined;
+  setItemsListingPreferences(
+    props.path || props.itemtype,
+    props.itemtype,
+    cleared.prefs,
+  );
+  if (offered.has("genre") && p.genreIds !== undefined) {
+    p.genreIds = undefined;
+    const query = { ...route.query };
+    delete query.genre_id;
+    delete query.genre_ids;
+    router.replace({ query });
+  }
+  loadData(true, undefined, true);
+};
+
+const { listingCount, restoreCount } = useListingCount(props, {
+  params,
+  baseOffset,
+  pagedItems,
+  allItemsReceived,
+  loading,
+});
+
+watchEffect(() => {
+  if (!showSearchInput.value) {
+    searchHasFocus.value = false;
+  }
+});
+
+// the filters a listing offers in its menu
+const filterMenuItems = function () {
+  const items: ToolBarMenuItem[] = [];
+
+  // library only filter
+  if (props.showLibraryOnlyFilter === true) {
+    items.push({
+      label: "tooltip.filter_library",
+      icon: LibraryBig,
+      action: toggleLibraryOnlyFilter,
+      active: params.value.libraryOnly,
+      overflowAllowed: true,
+    });
+  }
+
+  // genre filter
+  if (props.showGenreFilter === true && genreOptions.value.length > 0) {
+    const current = params.value.genreIds;
+    const activeIds = Array.isArray(current)
+      ? current
+      : typeof current === "number"
+        ? [current]
+        : [];
+    items.push({
+      label: "tooltip.filter_genre",
+      icon: GenreIcon,
+      disabled: loading.value,
+      active: activeIds.length > 0,
+      closeOnContentClick: false,
+      overflowAllowed: true,
+      subItems: genreOptions.value.map((genre) => {
+        const selected = activeIds.includes(genre.value);
+        return {
+          label: genre.label,
+          selected,
+          action: () => toggleGenreFilter(genre.value),
+        };
+      }),
+    });
+  }
+
+  // favorites only filter
+  if (props.showFavoritesOnlyFilter === true) {
+    items.push({
+      label: "tooltip.filter_favorites",
+      icon: Heart,
+      action: toggleFavoriteFilter,
+      active: params.value.favoritesOnly,
+      overflowAllowed: true,
+    });
+  }
+
+  // hide fully played filter (e.g. podcast episodes)
+  if (props.showHideFullyPlayedFilter === true) {
+    items.push({
+      label: "tooltip.filter_hide_fully_played",
+      icon: EyeOff,
+      action: toggleHideFullyPlayedFilter,
+      active: params.value.hideFullyPlayed,
+      overflowAllowed: true,
+    });
+  }
+
+  // album artists only filter
+  if (props.showAlbumArtistsOnlyFilter === true) {
+    items.push({
+      label: "tooltip.album_artist_filter",
+      icon: MicVocal,
+      action: toggleAlbumArtistsFilter,
+      active: params.value.albumArtistsFilter,
+      overflowAllowed: true,
+    });
+  }
+
+  // collapse collections filter
+  if (props.showCollapseCollections === true) {
+    items.push({
+      label: "tooltip.collapse_collections",
+      icon: Files,
+      action: toggleCollapseCollections,
+      active: params.value.collapseCollections,
+      overflowAllowed: true,
+    });
+  }
+
+  // has media mappings filter (hide empty genres / show only defaults)
+  if (props.showHideEmptyFilter === true) {
+    const hef = params.value.hideEmptyFilter;
+    items.push({
+      label:
+        hef === true
+          ? "tooltip.show_only_default_genres"
+          : hef === null
+            ? "tooltip.show_all_genres"
+            : "tooltip.hide_empty_genres",
+      icon: hef === true ? EyeClosed : hef === null ? Layers : Eye,
+      action: toggleHideEmptyFilter,
+      active: hef === true || hef === null,
+      overflowAllowed: true,
+    });
+  }
+
+  // album type filter
+  if (props.showAlbumTypeFilter) {
+    items.push({
+      label: "tooltip.album_type",
+      icon: Disc3,
+      disabled: loading.value,
+      active: params.value.albumType && params.value.albumType.length > 0,
+      closeOnContentClick: false,
+      overflowAllowed: true,
+      subItems: props.albumTypeFilterOptions.map((key) => {
+        return {
+          label: `album_type.${key}`,
+          selected: params.value.albumType?.includes(key),
+          action: () => {
+            changeAlbumTypeFilter(key);
+          },
+        };
+      }),
+    });
+  }
+
+  // provider filter — lives in the overflow menu alongside the other filters and
+  // shows the active dot when it narrows results (multi-select stays open to
+  // toggle several; single-select closes on pick).
+  if (providerFilterAvailable.value && !props.requireProviderSelection) {
+    items.push({
+      label: "tooltip.filter_provider",
+      icon: Package,
+      disabled: loading.value,
+      active: !!params.value.provider && params.value.provider.length > 0,
+      closeOnContentClick: props.singleProviderFilter,
+      overflowAllowed: true,
+      subItems: providerFilterSubItems(),
+    });
+  }
+
+  return items;
+};
+
+const expandedMenuItems = computed(() => {
+  const items: ToolBarMenuItem[] = [];
+
+  // toggle select menu item
+  if (props.showSelectButton !== false) {
+    if (showCheckboxes.value) {
+      items.push({
+        label: "tooltip.select_all",
+        icon: CheckCheck,
+        action: selectAll,
+        overflowAllowed: true,
+      });
+    }
+    items.push({
+      label: showCheckboxes.value
+        ? "tooltip.exit_select_items"
+        : "tooltip.select_items",
+      icon: ListChecks,
+      action: toggleCheckboxes,
+      active: showCheckboxes.value,
+      overflowAllowed: true,
+    });
+  }
+  // the filters; the title bar controls have them in the Filters panel
+  if (!props.libraryToolbar) items.push(...filterMenuItems());
+
+  // refresh action
+  if (
+    props.showRefreshButton !== false ||
+    (newContentAvailable.value && !props.refreshOnParentUpdate)
+  ) {
+    items.push({
+      label: newContentAvailable.value
+        ? "tooltip.refresh_new_content"
+        : "tooltip.refresh",
+      icon: RefreshCw,
+      action: onRefreshClicked,
+      active: newContentAvailable.value,
+      disabled: loading.value,
+      overflowAllowed: !["playlisttracks"].includes(props.itemtype),
+    });
+  }
+
+  // toggle search (auto-hidden for small listings); the title bar controls
+  // have their own
+  if (searchAvailable.value && !props.libraryToolbar) {
+    items.push({
+      label: searchButtonCloses.value
+        ? "close"
+        : isSearchActive.value
+          ? "tooltip.search_filter_active"
+          : "tooltip.search",
+      icon: searchButtonCloses.value ? X : Search,
+      action: toggleSearch,
+      active: isSearchActive.value && !searchButtonCloses.value,
+      disabled: loading.value,
+      overflowAllowed: false,
+    });
+  }
+
+  // provider selector — a required single selection shown as a dedicated button
+  // beside search (like the conditional search button). It always has a provider
+  // chosen, so it is not a filter and never shows the active dot. The title bar
+  // controls have it in the Filters panel.
+  if (
+    providerFilterAvailable.value &&
+    props.requireProviderSelection &&
+    !props.libraryToolbar
+  ) {
+    items.push({
+      label: "tooltip.select_provider",
+      icon: Package,
+      disabled: loading.value,
+      // single selection: close on pick so only one stays checked.
+      closeOnContentClick: true,
+      overflowAllowed: false,
+      subItems: providerFilterSubItems(),
+    });
+  }
+
+  // the title bar controls pick the view and cover size from the sort menu;
+  // when the view is controlled externally only the thumbs controls stay
+  if (!props.libraryToolbar && props.forcedViewMode !== "list")
+    items.push({
+      label: "tooltip.view_mode",
+      icon: viewMode.value == "list" ? LayoutList : LayoutGrid,
+      overflowAllowed: true,
+      subItems: [
+        {
+          label: "view.list",
+          icon: LayoutList,
+          hide: !!props.forcedViewMode,
+          selected: viewMode.value == "list",
+          close_on_click: false,
+          action: () => {
+            selectViewMode("list");
+          },
+        },
+        {
+          label: "view.panel",
+          icon: LayoutGrid,
+          hide: !!props.forcedViewMode,
+          selected: viewMode.value == "panel",
+          close_on_click: false,
+          action: () => {
+            selectViewMode("panel");
+          },
+        },
+        {
+          label: "grid_size",
+          hide: viewMode.value == "list",
+          // markRaw: the menu items land in a reactive array; a bare component
+          // definition there would be needlessly made reactive.
+          component: markRaw(GridSizeSlider),
+          componentProps: gridControlProps,
+        },
+      ],
+    });
+
+  if (props.extraMenuItems?.length) {
+    items.push(...props.extraMenuItems);
+  }
+
+  // toggle collapse/expand — kept as a dedicated button next to the menu
+  if (props.allowCollapse === true) {
+    items.push({
+      label: "tooltip.collapse_expand",
+      icon: ChevronUp,
+      action: toggleExpand,
+      overflowAllowed: false,
+    });
+  }
+
+  return items;
+});
+
+// a collapsed listing shows its expand button alone
+const collapsed = computed(
+  () => props.allowCollapse === true && !expanded.value,
+);
+const menuItems = computed(() =>
+  collapsed.value ? [] : expandedMenuItems.value,
+);
+// whether the expanded title bar has a ⋮ menu: Toolbar's rule for an enforced
+// overflow menu, which ItemsListing always uses
+const hasOverflowMenu = computed(() =>
+  expandedMenuItems.value.some(
+    (item) => !item.hide && item.overflowAllowed !== false,
+  ),
+);
+
+// Re-derive from the current props.path: a listing that stays mounted while
+// its path changes must not read and reset the settings saved for the old path.
+const savedPrefs = computed(
+  () =>
+    getItemsListingPreferences(props.path || props.itemtype, props.itemtype)
+      .value,
+);
+
+const restoreSettings = async function () {
+  // restore settings for this path/itemtype
+  const prefs = savedPrefs.value;
+
+  // a tab never saved, or no longer offered, is the first one
+  if (props.toolBarTabs?.length) {
+    activeTabId.value = props.toolBarTabs.some(
+      (tab) => tab.id === prefs.activeTab,
+    )
+      ? prefs.activeTab!
+      : props.toolBarTabs[0].id;
+  }
+
+  // get stored/default viewMode for this itemtype
+  if (props.forcedViewMode) {
+    viewMode.value = props.forcedViewMode;
+  } else if (prefs.viewMode) {
+    viewMode.value =
+      prefs.viewMode === "panel_compact" ? "panel" : prefs.viewMode;
+  } else if (
+    ["artists", "similarartists", "albums", "genres"].includes(props.itemtype)
+  ) {
+    viewMode.value = "panel";
+  } else {
+    viewMode.value = "list";
+  }
+
+  gridSize.value = normalizeGridSize(prefs.gridSize);
+  showGridActions.value =
+    prefs.showActions ??
+    defaultShowActions(
+      prefs.viewMode,
+      props.itemtype,
+      props.hideActionsByDefault,
+    );
+
+  // get stored/default sortBy for this itemtype
+  if (props.sortListing) {
+    if (sortOptionsLoaded.value) {
+      const defaultSortBy = sortOptions.value[0]
+        ? librarySorting.sortByOption(sortOptions.value[0])
+        : params.value.sortBy;
+      const normalizedSortBy = librarySorting.normalizeSortBy(
+        prefs.sortBy || defaultSortBy,
+      );
+      params.value.sortBy = normalizedSortBy;
+      if (prefs.sortBy && normalizedSortBy !== prefs.sortBy) {
+        setItemsListingPreference(
+          props.path || props.itemtype,
+          props.itemtype,
+          "sortBy",
+          normalizedSortBy,
+        );
+      }
+    }
+  }
+
+  // a filter the saved settings leave off is turned off here too: a save that
+  // lands while a later one is still queued restores what it carried, and the
+  // later one has to be able to take that back
+  // get stored/default favoriteOnlyFilter for this itemtype
+  if (props.showFavoritesOnlyFilter !== false) {
+    params.value.favoritesOnly = Boolean(prefs.favoriteFilter);
+  }
+
+  if (props.showHideFullyPlayedFilter === true) {
+    params.value.hideFullyPlayed = Boolean(prefs.hideFullyPlayedFilter);
+  }
+
+  // get stored/default libraryOnlyFilter for this itemtype
+  if (props.showLibraryOnlyFilter !== false) {
+    params.value.libraryOnly = Boolean(prefs.libraryFilter);
+  }
+
+  // get stored/default albumArtistsOnlyFilter for this itemtype
+  if (props.showAlbumArtistsOnlyFilter !== false) {
+    params.value.albumArtistsFilter = Boolean(prefs.albumArtistsFilter);
+  }
+
+  // get stored/default collapse Collection for this itemtype
+  if (props.showCollapseCollections !== false) {
+    params.value.collapseCollections = Boolean(prefs.collapseCollections);
+  }
+
+  // get stored/default hideEmptyFilter for this itemtype (default: true = hide empty)
+  if (props.showHideEmptyFilter) {
+    params.value.hideEmptyFilter =
+      prefs.hideEmptyFilter !== undefined ? prefs.hideEmptyFilter : true;
+  }
+
+  // get stored/default expand property for this itemtype
+  if (props.allowCollapse !== false && prefs.expand !== undefined) {
+    expanded.value = prefs.expand;
+  }
+
+  // get stored/default albumType filter for this itemtype
+  if (props.showAlbumTypeFilter === true) {
+    params.value.albumType = prefs.albumType;
+  }
+
+  // the carried-in album types outrank the saved filter, on every restore
+  const carriedTypes = offeredCarriedAlbumTypes();
+  if (carriedTypes) params.value.albumType = carriedTypes;
+
+  // get stored/default provider filter for this itemtype
+  // only apply stored filter if there are multiple providers available
+  // with a single provider, any stored filter is either redundant or stale
+  if (providerFilterAvailable.value) {
+    const validIds = new Set(musicProviders.value.map((p) => p.value));
+    const filtered = (prefs.providerFilter ?? []).filter((id) =>
+      validIds.has(id),
+    );
+    // single-select mode keeps at most one provider, so collapse any stored
+    // multi-select value (e.g. left over from a previous multi-select listing).
+    const next = singleProviderSelect.value ? filtered.slice(0, 1) : filtered;
+    params.value.provider = next.length > 0 ? next : undefined;
+  }
+
+  // the carried-in provider outranks the saved filter, on every restore
+  const carried = offeredCarriedProvider();
+  if (carried !== undefined) params.value.provider = [carried];
+
+  // required selector: when nothing valid is stored, default to the first
+  // available provider so exactly one is always selected.
+  if (
+    props.requireProviderSelection &&
+    musicProviders.value.length > 0 &&
+    !params.value.provider?.length
+  ) {
+    const offered = musicProviders.value.map((provider) => provider.value);
+    const preferred = props.defaultProvider;
+    params.value.provider = [
+      preferred && offered.includes(preferred) ? preferred : offered[0],
+    ];
+  }
+
+  // get stored searchquery (but only if we're allowed to store the state);
+  // none saved is no search
+  if (props.restoreState) {
+    params.value.search = prefs.search ?? "";
+  }
+};
+
+// lifecycle hooks
+const keyListener = function (e: KeyboardEvent) {
+  if (store.dialogActive || store.showPlayersMenu) return;
+  if (e.key === "Escape") {
+    if (showSearchInput.value) {
+      e.preventDefault();
+      closeSearch();
+    }
+    return;
+  }
+  if (!props.allowKeyHooks || loading.value) return;
+  // Let searchInput handle this.
+  if (searchHasFocus.value) return;
+
+  // ignore keystrokes typed into another editable element (e.g. the search box
+  // in the player drawer) so we don't steal focus to our own search input.
+  const target = e.target as HTMLElement | null;
+  if (
+    target &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable)
+  ) {
+    return;
+  }
+
+  if (e.key === "a" && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    selectAll();
+  } else if (!searchHasFocus.value && e.key == "Backspace") {
+    focusSearch();
+  } else if (
+    !searchHasFocus.value &&
+    e.key.length == 1 &&
+    // Space belongs to the play/pause shortcut, and no search starts with one
+    e.key != " " &&
+    !e.ctrlKey &&
+    !e.metaKey
+  ) {
+    showSearch.value = true;
+    focusSearch();
+  }
+};
+
+// Always listen: an open search claims Escape before the window-level
+// back navigation (useEscapeBack) sees it, even without key hooks
+document.addEventListener("keydown", keyListener);
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", keyListener);
+});
+
+if (props.restoreState) {
+  // handle restore state
+  onBeforeUnmount(() => {
+    // rows of a move that is still saving may not be the order it ends with
+    if (loading.value || loadError.value || reorderSaving.value) {
+      store.prevState = undefined;
+      return;
+    }
+    const key = props.path || props.itemtype;
+    const el = document.querySelector(".content-section");
+
+    store.prevState = {
+      path: key,
+      parentUri: props.parentItem?.uri,
+      carried: carriesFilters(),
+      scrollPos: el?.scrollTop || 0,
+      pagedItems: pagedItems.value,
+      baseOffset: baseOffset.value,
+      allItemsReceived: allItemsReceived.value,
+      count: listingCount.value,
+      params: params.value,
+      displayedSort: displayedSort.value,
+    };
+  });
+}
+
+// watchers
+watch(
+  () => params.value.search,
+  (newVal) => {
+    if (newVal) showSearch.value = true;
+    loadData(undefined, undefined, true);
+    if (props.restoreState) {
+      setItemsListingPreference(
+        props.path || props.itemtype,
+        props.itemtype,
+        "search",
+        params.value.search,
+      );
+    }
+  },
+);
+watch(
+  () => props.path,
+  (newVal) => {
+    // always leave selection mode: the selection belongs to the previous
+    // folder, and the target may not offer the toggle to turn it off
+    selectedItems.value = [];
+    selectionAnchor = undefined;
+    showCheckboxes.value = false;
+    if (loading.value == true) return;
+    // completely reset if the path changes
+    pagedItems.value = [];
+    loadData(true);
+  },
+);
+watch(
+  () => props.parentItem,
+  () => {
+    if (props.refreshOnParentUpdate) {
+      // re-read the rows in place, so the list neither collapses nor scrolls;
+      // a move that is saving reads them back once more when it is done
+      if (pagedItems.value.length) void refreshTrackRows();
+      else if (!loading.value) loadData(true);
+    } else if (!loading.value) {
+      newContentAvailable.value = true;
+    }
+  },
+  { deep: true },
+);
+watch(
+  () => props.updateAvailable,
+  (newVal) => {
+    if (loading.value) return;
+    newContentAvailable.value = newVal;
+  },
+  { immediate: true },
+);
+
+// Watch savedPrefs and restore settings when they change (e.g., when user loads),
+// but not while this listing's own edits are still being saved: the listing
+// already shows those, and what lands first may not have them yet
+watch(
+  savedPrefs,
+  () => {
+    if (holdRestore()) return;
+    restoreSettings();
+  },
+  { immediate: true },
+);
+
+// what the saves made the listing wait for: nothing changes after they went
+// through, and after one failed the listing goes back to what is saved
+const reconcileSavedSettings = function () {
+  // a listing that was left meanwhile has nothing to catch up on, and its
+  // params now belong to the cached visit
+  if (isDisposed()) return;
+  // a restored search reloads by itself, from its own watcher; a restored tab
+  // does not, so it counts
+  const filtersKey = () =>
+    JSON.stringify({
+      ...params.value,
+      offset: undefined,
+      limit: undefined,
+      search: undefined,
+      tab: activeTabId.value,
+    });
+  const before = filtersKey();
+  restoreSettings();
+  if (filtersKey() !== before) loadData(true, undefined, true);
+};
+
+// the page is told which provider the listing is on, a restored visit
+// included, so it can show that without a load of its own
+watch(
+  () => params.value.provider,
+  (provider) => emit("provider-change", provider),
+  { deep: true, immediate: true },
+);
+
+// When a provider stops being usable at runtime, drop it from the active filter
+// and reload so the view refreshes without a remount. Only the live query is
+// touched, not the saved preference: a temporarily unavailable provider keeps
+// its filter so it is reapplied on return. Cleaning up removed providers from
+// the saved preference is handled by pruneStaleProviderFilters.
+watch(
+  () => musicProviders.value.map((p) => p.value).join("|"),
+  () => {
+    if (!params.value.provider || params.value.provider.length === 0) return;
+    const validIds = new Set(musicProviders.value.map((p) => p.value));
+    const next = params.value.provider.filter((id) => validIds.has(id));
+    if (next.length === params.value.provider.length) return;
+    params.value.provider = next.length > 0 ? next : undefined;
+    loadData(true, undefined, true);
+  },
+);
+
+const itemtypeToMediaType: Partial<Record<string, MediaType>> = {
+  tracks: MediaType.TRACK,
+  albums: MediaType.ALBUM,
+  artists: MediaType.ARTIST,
+  playlists: MediaType.PLAYLIST,
+  audiobooks: MediaType.AUDIOBOOK,
+  podcasts: MediaType.PODCAST,
+};
+
+const loadGenreOptions = async () => {
+  if (!props.showGenreFilter) return;
+
+  try {
+    const pageSize = 100;
+    const all: { label: string; value: number }[] = [];
+    let offset = 0;
+    let page: Genre[];
+    const mediaType = itemtypeToMediaType[props.itemtype];
+
+    do {
+      // the paging can outlast the listing, so stop fetching once it is gone
+      if (isDisposed()) return;
+
+      page = await api.getLibraryGenres({
+        limit: pageSize,
+        offset,
+        sort_field: SortField.NAME,
+        hide_empty: true, // always hide empty genres in the filter dropdown
+        media_type: mediaType, // filter to genres relevant for this media type
+      });
+      for (const genre of page) {
+        all.push({
+          label: genre.name,
+          value: Number(genre.item_id),
+        });
+      }
+      offset += pageSize;
+    } while (page.length === pageSize);
+
+    genreOptions.value = all;
+  } catch {
+    toast.error(t("settings.error_loading_genres"));
+  }
+};
+
+let _unsubscribeMediaEvents: (() => void) | undefined;
+let _unsubscribeFavorites: (() => void) | undefined;
+
+const clearSelection = () => {
+  selectedItems.value = [];
+  selectionAnchor = undefined;
+  showCheckboxes.value = false;
+};
+
+// every item is loaded and selected, so select all has nothing left to add
+const allSelected = computed(
+  () =>
+    baseOffset.value === 0 &&
+    allItemsReceived.value &&
+    selectedItems.value.length >=
+      pagedItems.value.filter((x) => !isParentDirItem(x)).length,
+);
+
+onBeforeUnmount(() => {
+  eventbus.off("clearSelection", clearSelection);
+  _unsubscribeMediaEvents?.();
+  _unsubscribeFavorites?.();
+});
+
+onMounted(async () => {
+  if (props.sortListing) {
+    try {
+      serverSortOptions.value = await api.getSortOptions(props.sortListing);
+    } catch {
+      toast.error(t("settings.error_loading_sort_options"), {
+        id: "library-sort-options-error",
+      });
+    }
+    sortOptionsLoaded.value = true;
+    if (isDisposed()) return;
+    restoreSettings();
+  }
+
+  // for the main listings (e.g. artists, albums etc.) we remember the scroll position
+  // so we can jump back there on back navigation
+  const key = props.path || props.itemtype;
+  if (
+    props.restoreState &&
+    store.prevState?.path == key &&
+    store.prevState.parentUri == props.parentItem?.uri &&
+    store.prevState.params.sortField ===
+      store.prevState.displayedSort.sortField &&
+    store.prevState.params.sortDirection ===
+      store.prevState.displayedSort.sortDirection &&
+    cachedVisitApplies()
+  ) {
+    restoredFromPrevState = true;
+    params.value = store.prevState.params;
+    pagedItems.value = store.prevState.pagedItems;
+    baseOffset.value = store.prevState.baseOffset;
+    displayedSort.value = store.prevState.displayedSort;
+    allItemsReceived.value = store.prevState.allItemsReceived;
+    restoreCount(store.prevState.count);
+    if (props.sortListing) {
+      params.value.sortBy = librarySorting.normalizeSortBy(params.value.sortBy);
+    }
+    // what the last visit left behind gives way to a provider or album types
+    // carried in by a link, unless it already came from there
+    const carried = offeredCarriedProvider();
+    const switchProvider =
+      carried !== undefined && params.value.provider?.[0] !== carried;
+    if (switchProvider) params.value.provider = [carried];
+    const carriedTypes = offeredCarriedAlbumTypes();
+    const switchAlbumTypes =
+      carriedTypes !== undefined &&
+      !sameAlbumTypes(params.value.albumType, carriedTypes);
+    if (switchAlbumTypes) params.value.albumType = carriedTypes;
+    const switchFilters = switchProvider || switchAlbumTypes;
+    if (!switchFilters) {
+      // scroll the main listing back to its previous scroll position
+      nextTick(() => {
+        const el = document.querySelector(".content-section") as HTMLElement;
+
+        // a window further down goes straight there: on its way, the top of
+        // its rows would show and load the rows above them
+        if (el && baseOffset.value > 0) {
+          el.scrollTop = store.prevState!.scrollPos;
+        } else if (el) {
+          scrollElement(el, store.prevState!.scrollPos, 50);
+        }
+      });
+    }
+    loading.value = false;
+    if (applyQueryGenreFilter() || switchFilters) {
+      loadData(true, undefined, true);
+    }
+  } else {
+    applyQueryGenreFilter();
+    loadData(true);
+  }
+
+  await loadGenreOptions();
+  // The await can outlast the listing, and the unmount hook only reaches what
+  // was already set up by the time it ran.
+  if (isDisposed()) return;
+
+  // Listen for selection clearing events
+  eventbus.on("clearSelection", clearSelection);
+
+  // signal if/when items get played/updated/removed
+  _unsubscribeMediaEvents = api.subscribe_multi(
+    [
+      EventType.MEDIA_ITEM_UPDATED,
+      EventType.MEDIA_ITEM_DELETED,
+      EventType.MEDIA_ITEM_PLAYED,
+    ],
+    (evt: EventMessage) => {
+      if (evt.event == EventType.MEDIA_ITEM_DELETED) {
+        pagedItems.value = pagedItems.value.filter(
+          (i) => i.uri != evt.object_id,
+        );
+      } else if (evt.event == EventType.MEDIA_ITEM_UPDATED) {
+        // update item
+        const idx = pagedItems.value.findIndex((i) => i.uri == evt.object_id);
+        if (idx >= 0) {
+          pagedItems.value[idx] = keepOwnFavorite(
+            evt.data as MediaItemType,
+            pagedItems.value[idx],
+          );
+        }
+      } else if (evt.event == EventType.MEDIA_ITEM_PLAYED) {
+        // update item
+        const idx = pagedItems.value.findIndex((i) => i.uri == evt.object_id);
+        if (idx >= 0) {
+          const item = pagedItems.value[idx];
+          if (itemSupportsPlayLog(item)) {
+            const playData = evt.data as Record<string, unknown>;
+            item.fully_played = playData["fully_played"] as boolean;
+            item.resume_position_ms =
+              ((playData["seconds_played"] as number) ?? 0) * 1000;
+          }
+        }
+      }
+    },
+  );
+
+  // the user's own like or dislike, wherever they made it. A listing can hold
+  // the same item on more than one row (a playlist listing a track twice), and
+  // every one of them shows the state.
+  _unsubscribeFavorites = subscribeOwnFavorites((update) => {
+    for (const item of pagedItems.value) {
+      if (item.uri == update.uri) setFavoriteState(item, update.favorite);
+    }
+  });
+});
+
+watch(
+  () => route.query,
+  () => {
+    if (applyQueryGenreFilter()) {
+      loadData(true, undefined, true);
+    }
+  },
+  { deep: true },
+);
+
+const selectAll = async function () {
+  // Unknown server totals are treated conservatively to avoid instant selection.
+  const itemCount =
+    props.total ??
+    (allItemsReceived.value
+      ? baseOffset.value + pagedItems.value.length
+      : Number.POSITIVE_INFINITY);
+  if (itemCount <= 250) {
+    await selectEveryItem();
+    return;
+  }
+  // This could be a large selection. Prevent accidental activation
+  // by asking the user for a confirmation
+  eventbus.emit("deleteConfirmationDialog", {
+    title: t("tooltip.select_all"),
+    message: t("select_all_confirmation"),
+    confirmLabel: t("yes"),
+    destructive: false,
+    onConfirm: selectEveryItem,
+  });
+};
+
+defineExpose({
+  sortField: computed(() => displayedSort.value.sortField),
+  sortDirection: computed(() => displayedSort.value.sortDirection),
+  reload: () => {
+    loadData(true, true);
+    reloadLetterIndex();
+  },
+  // whether the item is absent while every item of the unfiltered listing is
+  // loaded; a filter leaves items out on purpose
+  isMissing: (uri: string) =>
+    baseOffset.value === 0 &&
+    allItemsReceived.value &&
+    !hasActiveFilters.value &&
+    !pagedItems.value.some((i) => i.uri === uri),
+});
+
+/** Loads the remaining pages and puts every item in the selection. */
+async function selectEveryItem() {
+  await loadAllAbove();
+  await loadAllItems();
+  selectedItems.value = pagedItems.value.filter((x) => !isParentDirItem(x));
+  showCheckboxes.value = true;
+}
+
+/** Whether both selections hold the same album types, in any order. */
+function sameAlbumTypes(current: string[] | undefined, other: string[]) {
+  return (
+    current?.length === other.length &&
+    other.every((type) => current.includes(type))
+  );
+}
+</script>
+
+<style scoped>
+.listing-search-slot {
+  --listing-search-width: clamp(0px, calc(100vw - 560px), 280px);
+  display: flex;
+  width: var(--listing-search-width);
+}
+
+.listing-search-enter-active,
+.listing-search-leave-active {
+  overflow: hidden;
+  transition: width 320ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.listing-search-enter-from,
+.listing-search-leave-to {
+  width: 0;
+}
+
+.listing-search--inline {
+  font-size: 0.9375rem;
+  font-weight: 400;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .listing-search-enter-active,
+  .listing-search-leave-active {
+    transition: none;
+  }
+}
+
+.disc-header {
+  display: flex;
+  align-items: flex-end;
+  height: 100%;
+  padding: 16px 8px 8px;
+  font-size: 1.15rem;
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+/* ThumbView panel columns */
+.col-2 {
+  width: 50%;
+  max-width: 50%;
+  flex-basis: 50%;
+  padding: 8px;
+}
+.col-3 {
+  width: 33.3%;
+  max-width: 33.3%;
+  flex-basis: 33.3%;
+  padding: 8px;
+}
+.col-4 {
+  width: 25%;
+  max-width: 25%;
+  flex-basis: 25%;
+  padding: 8px;
+}
+.col-5 {
+  width: 20%;
+  max-width: 20%;
+  flex-basis: 20%;
+  padding: 8px;
+}
+.col-6 {
+  width: 16.6%;
+  max-width: 16.6%;
+  flex-basis: 16.6%;
+  padding: 8px;
+}
+.col-7 {
+  width: 14.2%;
+  max-width: 14.2%;
+  flex-basis: 14.2%;
+  padding: 8px;
+}
+.col-8 {
+  width: 12.5%;
+  max-width: 12.5%;
+  flex-basis: 12.5%;
+  padding: 8px;
+}
+.col-9 {
+  width: 11.1%;
+  max-width: 11.1%;
+  flex-basis: 11.1%;
+  padding: 8px;
+}
+.col-10 {
+  width: 10%;
+  max-width: 10%;
+  flex-basis: 10%;
+  padding: 8px;
+}
+.col-11 {
+  width: 9.09%;
+  max-width: 9.09%;
+  flex-basis: 9.09%;
+  padding: 8px;
+}
+.col-12 {
+  width: 8.33%;
+  max-width: 8.33%;
+  flex-basis: 8.33%;
+  padding: 8px;
+}
+.content-tabs {
+  padding: 10px 16px 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+</style>
