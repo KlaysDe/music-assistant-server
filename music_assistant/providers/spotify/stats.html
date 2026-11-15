@@ -7,7 +7,7 @@
   <title>Spotify request stats</title>
   <style nonce="__STATS_NONCE__">
     :root {
-      color-scheme: light dark;
+      color-scheme: light;
       --page: #f4f6f8;
       --panel: #fff;
       --panel-soft: #f8fafb;
@@ -24,6 +24,7 @@
     }
     @media (prefers-color-scheme: dark) {
       :root {
+        color-scheme: dark;
         --page: #11171c; --panel: #1a2229; --panel-soft: #202a32;
         --ink: #e7edf1; --muted: #a1adb7; --line: #303c46;
         --accent: #4ac28d; --accent-soft: #203a30; --blue: #8ba9f1;
@@ -41,7 +42,8 @@
     .subtitle { margin: 6px 0 0; color: var(--muted); }
     .controls { display: flex; align-items: center; gap: 12px; }
     .window-control { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--muted); }
-    select { border: 0; outline: 0; background: transparent; color: var(--ink); font-weight: 650; cursor: pointer; }
+    select { border: 0; outline: 0; background: var(--panel); color: var(--ink); font-weight: 650; cursor: pointer; }
+    select option { background: var(--panel); color: var(--ink); }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     .refresh-note { min-width: 92px; color: var(--muted); font-size: 12px; text-align: right; }
     .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
