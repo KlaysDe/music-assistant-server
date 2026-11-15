@@ -22,9 +22,9 @@ from typing import Any
 SERVER_REPOSITORY = "KlaysDe/music-assistant-server"
 UPSTREAM_SERVER = "music-assistant/server"
 UPSTREAM_FRONTEND = "music-assistant/frontend"
-SERVER_PATCH_REF = "refs/heads/spotify-prefer-developer-test"
+SERVER_PATCH_REF = "refs/heads/spotify-archive-playlist-test"
 SERVER_PATCH_BASE = "8f2346bb952576849460f0d00da73a9a40fc136d"
-SERVER_PATCH_HEAD = "a05742609f6fa13a2e8ff1ee2d98cfbc5ea75b66"
+SERVER_PATCH_HEAD = "c8a47f398177d211bff6d3c722c5ce2889ec694c"
 SERVER_PATCHES = (
     "9ca1bd50bf351686d75840f7e1b2e03d6060ad60",
     "456d6625d487bc9d80cf99a3df1b00f362ef3d0b",
@@ -32,6 +32,8 @@ SERVER_PATCHES = (
     "5c339a854349205b8d9cfb52ee36ac6042434254",
     "d45b2f747c28f1891c50730cdaeed6c6ac2135af",
     "a05742609f6fa13a2e8ff1ee2d98cfbc5ea75b66",
+    "48c87218ff413427af11341723f987637e69aad0",
+    "c8a47f398177d211bff6d3c722c5ce2889ec694c",
 )
 FRONTEND_PATCH_REF = "refs/heads/spotify-stats-frontend"
 FRONTEND_PATCH_BASE = "ef6a9ad01adfaba0506dd5d550791305470472ab"
@@ -395,6 +397,7 @@ def run_qualification(source: Path, frontend: Path) -> None:
             "tests/providers/spotify/test_session.py",
             "tests/providers/spotify/test_session_fallback.py",
             "tests/providers/spotify/test_stats.py",
+            "tests/controllers/music/test_playlist_access.py",
         ],
         cwd=source,
     )
