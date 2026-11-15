@@ -1,4 +1,4 @@
-# Music Assistant (Spotify)
+# Music Assistant (Custom)
 
 This Home Assistant app runs Music Assistant with optional developer-app-first Spotify routing and request statistics. Configure Spotify and its routing preference in Music Assistant.
 
@@ -6,7 +6,7 @@ Home Assistant builds the app on the host from the pinned official Music Assista
 
 ## Install or move an existing installation
 
-1. Add `https://github.com/KlaysDe/music-assistant-server#ha-store` in the Home Assistant app store's **Repositories** menu, then install **Music Assistant (Spotify)**.
+1. Add `https://github.com/KlaysDe/music-assistant-server#ha-store` in the Home Assistant app store's **Repositories** menu, then install **Music Assistant (Custom)**.
 2. To move from the official DEV app, take Home Assistant app-only backups of the stopped DEV app and the fresh, stopped target. Use [`tools/migrate_backup.py`](https://github.com/KlaysDe/music-assistant-server/blob/ha-store/tools/migrate_backup.py) to prepare a restore for the target's full app ID. Run the tool on the Home Assistant host with local, unencrypted archives. The restore keeps the target's add-on options and transfers the Music Assistant settings, library, accounts, and Spotify Soloist pairing.
 3. Stop the previous app before starting this one. The two apps use the same host ports. Open the app's web interface and check that players and Spotify are available. If you use a reverse proxy, point it at the new app after verifying the web interface.
 

@@ -1,5 +1,5 @@
-name: Music Assistant (Spotify)
-version: "0.1.1"
+name: Music Assistant (Custom)
+version: "0.1.2"
 slug: music_assistant
 description: Music Assistant with configurable Spotify request routing and request statistics.
 url: https://github.com/KlaysDe/music-assistant-server/tree/ha-store/music_assistant
@@ -19,7 +19,7 @@ ingress: true
 ingress_port: 8094
 audio: true
 panel_icon: mdi:music-assistant
-panel_title: Music Assistant (Spotify)
+panel_title: Music Assistant (Custom)
 panel_admin: false
 apparmor: true
 map:
