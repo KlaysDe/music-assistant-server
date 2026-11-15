@@ -224,7 +224,7 @@ class MigrateBackupTest(unittest.TestCase):
         for member in (traversal, duplicate, symlink):
             with self.subTest(member=member.name):
                 _make_backup(self.source, DEV_APP, SOURCE_FILES, extra_member=member)
-                with self.assertRaisesRegex(BackupError, "unsupported or duplicate entry"):
+                with self.assertRaisesRegex(BackupError, "unsafe path|unsupported or duplicate entry"):
                     migrate_backup(self.source, self.target, self.output, TARGET)
         self.assertFalse(self.output.exists())
 
