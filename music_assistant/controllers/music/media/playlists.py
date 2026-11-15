@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from bisect import bisect_right
 from collections.abc import AsyncGenerator, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
@@ -59,6 +60,7 @@ from music_assistant.controllers.music.listing_cache import (
     cached_listing,
     invalidate_listings,
 )
+from music_assistant.controllers.music.playlist_touches import PlaylistTouch, PlaylistTouches
 from music_assistant.controllers.tasks.context import (
     get_current_task,
     report_current_task_failure,
@@ -99,6 +101,7 @@ _MIGRATION_REPORT_DETAIL_LIMIT: Final[int] = 200
 _MIGRATION_RESOLVE_BATCH_SIZE: Final[int] = 5
 _MIGRATION_VERIFY_RETRY_DELAYS: Final[tuple[int, ...]] = (1, 2, 4)
 _PLAYLIST_REMOVE_TASK_DOMAIN: Final[str] = "playlist_remove_tracks"
+_SPOTIFY_PLAYLIST_ID = re.compile(r"[A-Za-z0-9]{22}")
 # on top of the fetch failures, a provider may offer no playlist details at all
 _PLAYLIST_DETAILS_ERRORS: Final[tuple[type[Exception], ...]] = (
     *PROVIDER_FETCH_ERRORS,
@@ -198,6 +201,16 @@ class PlaylistController(MediaControllerBase[Playlist]):
             required_scope=Scope.LIBRARY_READ,
         )
         self.mass.register_api_command(
+            "music/playlists/export_provider_playlist",
+            self.export_provider_playlist,
+            required_scope=Scope.LIBRARY_READ,
+        )
+        self.mass.register_api_command(
+            "music/playlists/recent_touches",
+            self.recent_touches,
+            required_scope=Scope.LIBRARY_READ,
+        )
+        self.mass.register_api_command(
             "music/playlists/import_playlist",
             self.import_playlist,
             required_scope=Scope.LIBRARY_WRITE,
@@ -214,6 +227,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
         )
         # library ids of the playlists a move is under way for
         self._moving_playlists: set[str] = set()
+        self._playlist_touches: dict[str, PlaylistTouches] = {}
 
     @property
     def summary_query(self) -> tuple[str, dict[str, Any]]:
@@ -316,7 +330,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 )
         if favorite is not None:
             items = [item for item in items if item.favorite is favorite]
-        return apply_listing(
+        result = apply_listing(
             items,
             ListingType.PLAYLIST_TRACKS,
             search=search,
@@ -326,6 +340,11 @@ class PlaylistController(MediaControllerBase[Playlist]):
             offset=offset,
             random_seed=random_seed,
         )
+        if not offset and provider.domain == "spotify" and _SPOTIFY_PLAYLIST_ID.fullmatch(item_id):
+            self._record_playlist_touch(
+                provider.instance_id, item_id, library_item.item_id if library_item else None
+            )
+        return result
 
     async def iter_tracks(
         self,
@@ -643,6 +662,61 @@ class PlaylistController(MediaControllerBase[Playlist]):
             items.append(media_item_to_playlist_item(track))
         playlist_image_url = playlist.image.path if playlist.image else None
         return generate_m3u(playlist.name, items, playlist_image_url)
+
+    async def export_provider_playlist(
+        self, item_id: str, provider_instance_id_or_domain: str, force_refresh: bool = False
+    ) -> dict[str, Playlist | str]:
+        """
+        Return playlist metadata and a complete M3U8 export for an exact Spotify playlist.
+
+        :param item_id: The Spotify playlist ID.
+        :param provider_instance_id_or_domain: The exact Spotify provider instance ID.
+        :param force_refresh: Request updated membership from the provider.
+        :raises InvalidDataError: The request does not identify an exact Spotify playlist.
+        """
+        if (
+            not _SPOTIFY_PLAYLIST_ID.fullmatch(item_id)
+            or not provider_instance_id_or_domain.startswith("spotify--")
+        ):
+            raise InvalidDataError("An exact Spotify provider instance and playlist ID are required")
+        provider = self._playlist_provider(provider_instance_id_or_domain, True)
+        if not isinstance(provider, MusicProvider) or provider.domain != "spotify":
+            raise InvalidDataError("An exact Spotify provider instance is required")
+        playlist = await provider.get_playlist(item_id)
+        items = [
+            media_item_to_playlist_item(track)
+            async for track in self.iter_tracks(
+                item_id, provider.instance_id, force_refresh=force_refresh, strict_provider_instance=True
+            )
+        ]
+        image = playlist.image.path if playlist.image else None
+        return {"playlist": playlist, "m3u_data": generate_m3u(playlist.name, items, image)}
+
+    async def recent_touches(self, cursor: str | None = None) -> dict[str, str | list[dict[str, str]]]:
+        """
+        Return recent Spotify playlist accesses for the authenticated user.
+
+        :param cursor: The cursor returned on the previous poll.
+        """
+        user = get_current_user()
+        if user is None:
+            raise InsufficientPermissions("Playlist accesses require authentication")
+        journal = self._playlist_touches.get(user.user_id)
+        if journal is None:
+            return {"cursor": "", "playlists": []}
+        next_cursor, entries = journal.since(cursor)
+        visible = visible_music_sources(self.mass, user)
+        playlists = []
+        for entry in entries:
+            if visible is not None and entry.provider_instance not in visible:
+                continue
+            if entry.library_id is not None:
+                try:
+                    await self._get_visible_library_item(entry.library_id)
+                except (MediaNotFoundError, InsufficientPermissions):
+                    continue
+            playlists.append({"provider_instance": entry.provider_instance, "item_id": entry.item_id})
+        return {"cursor": next_cursor, "playlists": playlists}
 
     async def import_playlist(
         self,
@@ -1737,6 +1811,17 @@ class PlaylistController(MediaControllerBase[Playlist]):
         )
         await self.set_provider_mappings(db_id, provider_mappings, overwrite)
         self.logger.debug("updated %s in database: (id %s)", update.name, db_id)
+
+    def _record_playlist_touch(
+        self, provider_instance: str, item_id: str, library_id: str | None
+    ) -> None:
+        """Record an authenticated user's access to a provider playlist."""
+        if (user := get_current_user()) is None:
+            return
+        journal = self._playlist_touches.get(user.user_id)
+        if journal is None:
+            journal = self._playlist_touches[user.user_id] = PlaylistTouches()
+        journal.record(PlaylistTouch(provider_instance, item_id, library_id))
 
     async def _playlist_source(
         self, item_id: str, provider_instance_id_or_domain: str
