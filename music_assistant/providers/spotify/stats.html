@@ -172,6 +172,18 @@
       const endpoint = new URL("data", location.href);
       const colors = { "developer-token": "dev", "music-assistant": "ma" };
       const $ = (id) => document.getElementById(id);
+      const preferenceKey = (id) => `music-assistant.spotify-stats.${id}`;
+      const readPreference = (id) => {
+        try { return localStorage.getItem(preferenceKey(id)); } catch { return null; }
+      };
+      const savePreference = (id) => {
+        try { localStorage.setItem(preferenceKey(id), $(id).value); } catch { /* Storage is optional. */ }
+      };
+      for (const id of ["window", "metric"]) {
+        const saved = readPreference(id);
+        if ([...$(id).options].some((option) => option.value === saved)) $(id).value = saved;
+      }
+      let preferredEndpoint = readPreference("endpoint-filter") || "*";
       const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
       const fmt = (value) => number(value).toLocaleString();
       const duration = (seconds) => {
@@ -304,14 +316,13 @@
 
       function updateEndpointOptions(rows) {
         const select = $("endpoint-filter");
-        const current = select.value || "*";
         const endpoints = [...new Set(rows.map((row) => String(row.endpoint || "Unknown endpoint")))].sort();
         while (select.options.length > 1) select.remove(1);
         for (const name of endpoints) {
           const option = document.createElement("option");
           option.value = name; option.textContent = name; select.appendChild(option);
         }
-        select.value = endpoints.includes(current) ? current : "*";
+        select.value = endpoints.includes(preferredEndpoint) ? preferredEndpoint : "*";
       }
 
       function render(data) {
@@ -335,9 +346,9 @@
         renderTokens(data.tokens || {});
         drawChart(allRows, data, selectedEndpoint, $("metric").value);
         renderTable(rows);
-        $("updated").textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}`;
+        $("updated").textContent = `Updated ${timeLabel(data.observed_at, { hour: "numeric", minute: "2-digit", second: "2-digit" })}`;
         const started = number(data.started_at);
-        $("history-start").textContent = started ? `In-memory history since ${new Date(started * 1000).toLocaleString()}.` : "";
+        $("history-start").textContent = started ? `Collecting since ${new Date(started * 1000).toLocaleString()}.` : "";
       }
 
       function scheduleRefresh() {
@@ -390,11 +401,19 @@
       }
 
       $("window").addEventListener("change", () => {
+        savePreference("window");
         clearTimeout(timer);
         refresh(true);
       });
-      $("endpoint-filter").addEventListener("change", () => { if (latestData) render(latestData); });
-      $("metric").addEventListener("change", () => { if (latestData) render(latestData); });
+      $("endpoint-filter").addEventListener("change", () => {
+        preferredEndpoint = $("endpoint-filter").value;
+        savePreference("endpoint-filter");
+        if (latestData) render(latestData);
+      });
+      $("metric").addEventListener("change", () => {
+        savePreference("metric");
+        if (latestData) render(latestData);
+      });
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState !== "visible") {
           clearTimeout(timer);
