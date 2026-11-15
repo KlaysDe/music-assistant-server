@@ -41,6 +41,7 @@ class RequestPriority(IntEnum):
 REQUEST_PRIORITY: ContextVar[RequestPriority] = ContextVar(
     "REQUEST_PRIORITY", default=RequestPriority.NORMAL
 )
+_REQUEST_THROTTLE_DELAY: ContextVar[float] = ContextVar("request_throttle_delay", default=0.0)
 
 # share of the rate limit low priority requests may use,
 # the rest is headroom for user actions and playback
@@ -62,6 +63,11 @@ MAX_WAIT_TIME = 60
 def current_priority() -> RequestPriority:
     """Return the throttler priority of the current context."""
     return REQUEST_PRIORITY.get()
+
+
+def current_throttle_delay() -> float:
+    """Return the time in seconds spent at the throttler gate for this attempt."""
+    return _REQUEST_THROTTLE_DELAY.get()
 
 
 def set_request_priority(priority: RequestPriority) -> None:
@@ -357,7 +363,11 @@ def throttle_with_retries[ProviderT: _Throttleable, **P, R](
                             "%s was delayed for %.3f secs due to throttling", func.__name__, delay
                         )
                     try:
-                        return await func(self, *args, **kwargs)
+                        delay_token = _REQUEST_THROTTLE_DELAY.set(delay)
+                        try:
+                            return await func(self, *args, **kwargs)
+                        finally:
+                            _REQUEST_THROTTLE_DELAY.reset(delay_token)
                     except ResourceTemporarilyUnavailable as e:
                         self.logger.info("Attempt %s/%s failed: %s", attempt + 1, attempts, e)
                         server_wait = min(max(float(e.backoff_time), 0.0), MAX_RETRY_AFTER)

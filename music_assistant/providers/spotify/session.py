@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -21,17 +22,23 @@ from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.throttle_retry import (
     MAX_BACKOFF,
+    MAX_RETRY_AFTER,
     RequestPriority,
     ThrottlerManager,
     current_priority,
+    current_throttle_delay,
     parse_retry_after,
     throttle_with_retries,
 )
+
+from .request_stats import DEVELOPER_LABEL, MUSIC_ASSISTANT_LABEL, endpoint_label
 
 if TYPE_CHECKING:
     import logging
 
     from music_assistant.mass import MusicAssistant
+
+    from .request_stats import SpotifyRequestStats
 
 API_URL = "https://api.spotify.com/v1"
 
@@ -58,6 +65,7 @@ class SpotifySession:
         get_auth: Callable[[], Awaitable[dict[str, Any]]],
         on_unauthorized: Callable[[], None],
         has_fallback: bool = False,
+        request_stats: SpotifyRequestStats | None = None,
     ) -> None:
         """
         Initialize the session.
@@ -71,10 +79,13 @@ class SpotifySession:
         :param on_unauthorized: Called when Spotify rejects the access token of this session.
         :param has_fallback: Whether another session serves user actions and playback while this
             one is rate limited, so such a request gives up on a limit at once.
+        :param request_stats: Optional request history for this provider instance.
         """
         self.mass = mass
-        self.logger = logger
         self.name = name
+        self.token_label = DEVELOPER_LABEL if name == "dev" else MUSIC_ASSISTANT_LABEL
+        self.logger = logger.getChild(self.token_label)
+        self._request_stats = request_stats
         self.label = label
         self.throttler = throttler
         self._get_auth = get_auth
@@ -112,7 +123,6 @@ class SpotifySession:
         locale = self.mass.metadata.locale.replace("_", "-")
         language = locale.split("-")[0]
         headers = {"Accept-Language": f"{locale}, {language};q=0.9, *;q=0.5"}
-        self.logger.debug("handling get data %s/%s with kwargs %s", API_URL, endpoint, params)
         async with self._request(
             "GET",
             endpoint,
@@ -130,7 +140,7 @@ class SpotifySession:
 
                 self.logger.debug(
                     "Spotify API error: endpoint=%s, status=%s, reason=%s, message=%s",
-                    endpoint,
+                    endpoint_label("GET", endpoint),
                     response.status,
                     response.reason,
                     message,
@@ -250,56 +260,85 @@ class SpotifySession:
                 f"Spotify rate limited the {self.label}",
                 translation_key=RateLimited.translation_key,
             )
-        async with self.mass.http_session.request(
-            method, f"{API_URL}/{endpoint}", headers=headers, **kwargs
-        ) as response:
-            # handle spotify rate limiter
-            if response.status == 429:
-                backoff_time = parse_retry_after(response.headers.get("Retry-After"))
-                # another session serves user actions and playback meanwhile
-                moves_on = self._has_fallback and current_priority() is not RequestPriority.LOW
-                cooldown = max(backoff_time, self.throttler.initial_backoff)
-                # the gate closes before the body is read, so nothing follows this
-                # request to a client that just asked to wait
-                self.throttler.set_cooldown(cooldown)
-                reason = await _rate_limit_reason(response)
-                self._last_rate_limit_reason = reason
-                self._last_rate_limit_at = utc()
-                message = f"Spotify rate limited the {self.label}"
-                if reason:
-                    message += f" ({reason})"
-                quota_exceeded = reason == QUOTA_EXCEEDED
-                warned = False
-                if quota_exceeded:
-                    self._quota_answers += 1
-                    if warned := self._quota_answers == 1:
-                        self._warn_quota_exceeded(backoff_time)
-                if moves_on or (self._has_fallback and quota_exceeded):
-                    # a used up quota does not come back within a retry either: the gate stays
-                    # closed for the time asked and the request gives up right away
-                    if quota_exceeded:
-                        # a block that goes on is asked about less and less
-                        doublings = min(self._quota_answers - 1, 10)
-                        cooldown = max(
-                            cooldown,
-                            min(self.throttler.initial_backoff * 2**doublings, MAX_BACKOFF),
-                        )
+        route = endpoint_label(method, endpoint)
+        started = time.monotonic()
+        status = 0
+        try:
+            async with self.mass.http_session.request(
+                method, f"{API_URL}/{endpoint}", headers=headers, **kwargs
+            ) as response:
+                status = response.status
+                backoff_time = (
+                    parse_retry_after(response.headers.get("Retry-After")) if status == 429 else 0
+                )
+                self._record_attempt(route, status, started, backoff_time)
+                if status == 429:
+                    # another session serves user actions and playback meanwhile
+                    moves_on = self._has_fallback and current_priority() is not RequestPriority.LOW
+                    cooldown = max(backoff_time, self.throttler.initial_backoff)
+                    # the gate closes before the body is read, so nothing follows this
+                    # request to a client that just asked to wait
                     self.throttler.set_cooldown(cooldown)
-                    if not warned:
-                        # the caller moves on to the other session, so nothing else logs this
-                        self.logger.info(message)
-                    raise RetriesExhausted(message, translation_key=RateLimited.translation_key)
-                raise RateLimited(message, backoff_time=backoff_time)
-            self._quota_answers = 0
-            # handle token expired, raise ResourceTemporarilyUnavailable
-            # so it will be retried (and the token refreshed)
-            if response.status == 401:
-                self._on_unauthorized()
-                raise ResourceTemporarilyUnavailable("Token expired", backoff_time=1)
-            # handle temporary server error
-            if response.status in (502, 503):
-                raise ResourceTemporarilyUnavailable(backoff_time=30)
-            yield response
+                    reason = await _rate_limit_reason(response)
+                    self._last_rate_limit_reason = reason
+                    self._last_rate_limit_at = utc()
+                    message = f"Spotify rate limited the {self.label}"
+                    if reason:
+                        message += f" ({reason})"
+                    quota_exceeded = reason == QUOTA_EXCEEDED
+                    warned = False
+                    if quota_exceeded:
+                        self._quota_answers += 1
+                        if warned := self._quota_answers == 1:
+                            self._warn_quota_exceeded(backoff_time)
+                    if moves_on or (self._has_fallback and quota_exceeded):
+                        # a used up quota does not come back within a retry either: the gate stays
+                        # closed for the time asked and the request gives up right away
+                        if quota_exceeded:
+                            # a block that goes on is asked about less and less
+                            doublings = min(self._quota_answers - 1, 10)
+                            cooldown = max(
+                                cooldown,
+                                min(self.throttler.initial_backoff * 2**doublings, MAX_BACKOFF),
+                            )
+                        self.throttler.set_cooldown(cooldown)
+                        if not warned:
+                            # the caller moves on to the other session, so nothing else logs this
+                            self.logger.info(message)
+                        raise RetriesExhausted(message, translation_key=RateLimited.translation_key)
+                    raise RateLimited(message, backoff_time=backoff_time)
+                self._quota_answers = 0
+                # handle token expired, raise ResourceTemporarilyUnavailable
+                # so it will be retried (and the token refreshed)
+                if status == 401:
+                    self._on_unauthorized()
+                    raise ResourceTemporarilyUnavailable("Token expired", backoff_time=1)
+                # handle temporary server error
+                if status in (502, 503):
+                    raise ResourceTemporarilyUnavailable(backoff_time=30)
+                yield response
+        except aiohttp.ClientError, TimeoutError:
+            if not status:
+                self._record_attempt(route, status, started, 0)
+            raise
+
+    def _record_attempt(self, route: str, status: int, started: float, retry_after: int) -> None:
+        """Log and count an attempt once, before any retry or fallback."""
+        elapsed = time.monotonic() - started
+        wait = current_throttle_delay()
+        self.logger.debug(
+            "Spotify Web API %s %s → %s (%.0f ms response, %.0f ms throttle wait, %s priority)",
+            self.token_label,
+            route,
+            status or "transport error",
+            elapsed * 1000,
+            wait * 1000,
+            current_priority().name.lower(),
+        )
+        if self._request_stats is not None:
+            self._request_stats.record(
+                self.token_label, route, status, wait, elapsed, min(retry_after, MAX_RETRY_AFTER)
+            )
 
     def _warn_quota_exceeded(self, asked_wait: float) -> None:
         """
