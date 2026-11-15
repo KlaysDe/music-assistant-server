@@ -22,24 +22,30 @@ from typing import Any
 SERVER_REPOSITORY = "KlaysDe/music-assistant-server"
 UPSTREAM_SERVER = "music-assistant/server"
 UPSTREAM_FRONTEND = "music-assistant/frontend"
-SERVER_PATCH_REF = "refs/heads/spotify-archive-stats-theme"
-SERVER_PATCH_BASE = "8f2346bb952576849460f0d00da73a9a40fc136d"
-SERVER_PATCH_HEAD = "a2c7e58ca17fc7721291229aa993947313293095"
+SERVER_PATCH_REF = "refs/heads/queue-next-burst"
+SERVER_PATCH_BASE = "dda273a79e6d2a15be2549400141569b4b39126e"
+SERVER_PATCH_HEAD = "4b8ecbe39a3bd357b7eb6598ebf0fe9ef034f7e1"
 SERVER_PATCHES = (
-    "9ca1bd50bf351686d75840f7e1b2e03d6060ad60",
-    "456d6625d487bc9d80cf99a3df1b00f362ef3d0b",
-    "98aa41626448b5a38c8515fc68e8c4363a072a4a",
-    "5c339a854349205b8d9cfb52ee36ac6042434254",
-    "d45b2f747c28f1891c50730cdaeed6c6ac2135af",
-    "a05742609f6fa13a2e8ff1ee2d98cfbc5ea75b66",
-    "48c87218ff413427af11341723f987637e69aad0",
-    "c8a47f398177d211bff6d3c722c5ce2889ec694c",
-    "796d340cd645f8fe5226692e9bfc6b37dce0016d",
-    "a2c7e58ca17fc7721291229aa993947313293095",
+    "6bcc9dd67d966576fd8b57ae3cd812a56353974a",
+    "1156b915424c7b05f421d0edd21f491f48c9d253",
+    "be678b64bae171d7256ffe99ca70e23af3d6b6de",
+    "4296ba076699d88170906d937e8e1efbb72f3ece",
+    "251f0325125525a05ce7714061c9b4e1428cd10b",
+    "6b33f6b5882574df80b6bda6f2f22291842ff994",
+    "7968ab50e97992063f7aa17edf00c6ddc2581ab3",
+    "77d6bd38704b261f82731820a2be5c2ff636fd51",
+    "92cf0992adab5d97ef78958185d4da9adf64ab44",
+    "6c40811d61b0f735971409228e5e960bc423634d",
+    "cdf48f6b38a0c5af133ee134ce20374cf4f96f12",
+    SERVER_PATCH_HEAD,
 )
-FRONTEND_PATCH_REF = "refs/heads/spotify-stats-frontend"
-FRONTEND_PATCH_BASE = "ef6a9ad01adfaba0506dd5d550791305470472ab"
-FRONTEND_PATCH_HEAD = "1cd9fb2eb34c9ca8010c0dd19791c96fefbbb4a4"
+FRONTEND_PATCH_REF = "refs/heads/frontend-queue-next-burst"
+FRONTEND_PATCH_BASE = "46cb842678865bdc9dcfa703c13d817e792806ed"
+FRONTEND_PATCH_HEAD = "d092c4d2885a9acdcf34a088c924a85031deda3c"
+FRONTEND_PATCHES = (
+    "033d78bcf1a7e1dd63c3df172f21863e0e9a4424",
+    FRONTEND_PATCH_HEAD,
+)
 NIGHTLY_TAG = re.compile(r"^\d+\.\d+\.\d+\.dev\d+$")
 IMAGE_NAMESPACE = "music-assistant/server"
 MANIFEST_ACCEPT = ", ".join(
@@ -400,11 +406,24 @@ def run_qualification(source: Path, frontend: Path) -> None:
             "tests/providers/spotify/test_session_fallback.py",
             "tests/providers/spotify/test_stats.py",
             "tests/controllers/music/test_spotify_playlist_touches.py",
+            "tests/controllers/player_queues/test_next_burst.py",
+            "tests/controllers/player_queues/test_play_index_elapsed.py",
         ],
         cwd=source,
     )
     run(["corepack", "pnpm", "install", "--frozen-lockfile"], cwd=frontend)
-    run(["corepack", "pnpm", "exec", "vitest", "run", "tests/views/EditProvider.test.ts"], cwd=frontend)
+    run(
+        [
+            "corepack",
+            "pnpm",
+            "exec",
+            "vitest",
+            "run",
+            "tests/views/EditProvider.test.ts",
+            "tests/layouts/NextBtn.test.ts",
+        ],
+        cwd=frontend,
+    )
     run(["corepack", "pnpm", "build"], cwd=frontend)
 
 
@@ -474,7 +493,7 @@ def resolve_candidate(work_root: Path, release_token: str | None = None) -> Cand
     server_pyproject = run(["git", "show", f"{server_base}:pyproject.toml"], cwd=server_path)
     frontend_version, _wheel_sha = parse_frontend_dependency(server_pyproject)
     frontend_path = work_root / "frontend"
-    git_init_source(frontend_path, UPSTREAM_FRONTEND, frontend_version)
+    frontend_base = git_init_source(frontend_path, UPSTREAM_FRONTEND, frontend_version)
 
     server_patch_head = fetch_patch_ref(
         server_path, SERVER_PATCH_REF, "refs/remotes/channel/server-patches"
@@ -492,15 +511,15 @@ def resolve_candidate(work_root: Path, release_token: str | None = None) -> Cand
     frontend_patch_head = fetch_patch_ref(
         frontend_path, FRONTEND_PATCH_REF, "refs/remotes/channel/frontend-patches"
     )
-    frontend_base = run(["git", "merge-base", FRONTEND_PATCH_BASE, "HEAD"], cwd=frontend_path)
-    if frontend_base != FRONTEND_PATCH_BASE:
-        raise SyncError("Selected frontend release is not based on the expected patch anchor")
-    if frontend_patch_head != FRONTEND_PATCH_HEAD:
-        raise SyncError(f"Frontend patch branch moved: expected {FRONTEND_PATCH_HEAD}, got {frontend_patch_head}")
-    frontend_parent = run(["git", "show", "-s", "--format=%P", FRONTEND_PATCH_HEAD], cwd=frontend_path)
-    if frontend_parent != FRONTEND_PATCH_BASE:
-        raise SyncError("Frontend patch anchor no longer has its expected upstream parent")
-    frontend_result = cherry_pick_series(frontend_path, (FRONTEND_PATCH_HEAD,))
+    require_ancestor(frontend_path, FRONTEND_PATCH_BASE, frontend_base, "frontend patch anchor")
+    verify_patch_chain(
+        frontend_path,
+        head=frontend_patch_head,
+        expected_head=FRONTEND_PATCH_HEAD,
+        commits=FRONTEND_PATCHES,
+        base=FRONTEND_PATCH_BASE,
+    )
+    frontend_result = cherry_pick_series(frontend_path, FRONTEND_PATCHES)
 
     return Candidate(
         release_tag=release_tag,
