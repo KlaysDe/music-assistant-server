@@ -14,6 +14,8 @@ from music_assistant.controllers.streams.constants import (
 CONF_DEFAULT_ENQUEUE_SELECT_ARTIST = "default_enqueue_select_artist"
 CONF_DEFAULT_ENQUEUE_SELECT_ALBUM = "default_enqueue_select_album"
 
+NEXT_PRESS_WINDOW = 0.35
+
 ENQUEUE_SELECT_ARTIST_DEFAULT_VALUE = "prefer_library"
 ENQUEUE_SELECT_ALBUM_DEFAULT_VALUE = "all_tracks"
 

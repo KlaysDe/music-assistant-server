@@ -83,6 +83,8 @@ class PlayerQueueData:
     started_session_id: str | None = None
     played_session_id: str | None = None
     play_action_refcount: int = 0
+    last_next_press: float | None = None
+    next_press_burst: bool = False
     # skip seconds awaiting the playback lock and the item they apply to; a burst of presses
     # is merged into one seek
     pending_skip_seconds: int = 0
