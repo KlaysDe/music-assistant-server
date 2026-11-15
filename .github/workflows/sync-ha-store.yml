@@ -1,0 +1,123 @@
+name: Qualify Music Assistant HA Store update
+
+on:
+  schedule:
+    - cron: "35 5 * * *"
+  push:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/sync-ha-store.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish only after server tests and frontend build pass"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-store-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository_owner == 'KlaysDe' && github.repository == 'KlaysDe/music-assistant-server'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.qualify.outputs.release_tag }}
+      digest: ${{ steps.qualify.outputs.digest }}
+      server_base: ${{ steps.qualify.outputs.server_base }}
+      frontend_version: ${{ steps.qualify.outputs.frontend_version }}
+      server_sha: ${{ steps.qualify.outputs.server_sha }}
+      frontend_sha: ${{ steps.qualify.outputs.frontend_sha }}
+    steps:
+      - name: Check out the HA Store channel branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ha-store
+          path: channel
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install upstream Python package manager
+        run: python -m pip install --disable-pip-version-check uv
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install frontend package manager
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.8.0 --activate
+
+      - name: Check automation helpers
+        working-directory: channel
+        run: python -m unittest discover -s .github/tests -v
+
+      - name: Qualify the latest matching nightly
+        id: qualify
+        working-directory: channel
+        run: |
+          STOP_COMMANDS_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          echo "::stop-commands::$STOP_COMMANDS_TOKEN"
+          set +e
+          python .github/scripts/sync_channel.py qualify --channel-root .
+          result=$?
+          echo "::$STOP_COMMANDS_TOKEN::"
+          exit "$result"
+
+  publish:
+    needs: qualify
+    if: >-
+      github.repository_owner == 'KlaysDe' &&
+      github.repository == 'KlaysDe/music-assistant-server' &&
+      (github.event_name == 'schedule' || inputs.publish == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Check out a clean HA Store channel branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ha-store
+          path: channel
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Publish the qualified nightly pins
+        working-directory: channel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_RELEASE_TAG: ${{ needs.qualify.outputs.release_tag }}
+          CANDIDATE_DIGEST: ${{ needs.qualify.outputs.digest }}
+          CANDIDATE_SERVER_BASE: ${{ needs.qualify.outputs.server_base }}
+          CANDIDATE_FRONTEND_VERSION: ${{ needs.qualify.outputs.frontend_version }}
+          CANDIDATE_SERVER_SHA: ${{ needs.qualify.outputs.server_sha }}
+          CANDIDATE_FRONTEND_SHA: ${{ needs.qualify.outputs.frontend_sha }}
+        run: >-
+          python .github/scripts/sync_channel.py publish --channel-root .
+          --release-tag "$CANDIDATE_RELEASE_TAG" --digest "$CANDIDATE_DIGEST"
+          --server-base "$CANDIDATE_SERVER_BASE" --frontend-version "$CANDIDATE_FRONTEND_VERSION"
+          --server-sha "$CANDIDATE_SERVER_SHA" --frontend-sha "$CANDIDATE_FRONTEND_SHA"
