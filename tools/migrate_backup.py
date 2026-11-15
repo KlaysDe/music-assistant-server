@@ -3,8 +3,8 @@
 
 Take unencrypted partial backups of both stopped apps on the same Supervisor.
 The target must be the newly installed custom app, before it has app data. Run
-this tool with Python 3.10+ in a private local directory on a filesystem that
-supports hard links. The output is unencrypted and contains account data.
+this tool with Python 3.10+ in a private local directory. On Unix the filesystem
+must support hard links. The output is unencrypted and contains account data.
 """
 
 from __future__ import annotations
@@ -233,8 +233,11 @@ def _write_outer(destination: Path, inner: Path, target: AppBackup, target_app: 
             result.addfile(info, io.BytesIO(encoded))
         temp.flush()
         os.fsync(temp.fileno())
-    # The hard link publishes a complete mode-0600 file and cannot overwrite one.
-    os.link(temp.name, destination)
+    # Publish a complete file without overwriting anything created concurrently.
+    if os.name == "nt":
+        os.rename(temp.name, destination)
+    else:
+        os.link(temp.name, destination)
     return slug
 
 
