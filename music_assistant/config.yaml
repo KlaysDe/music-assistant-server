@@ -1,0 +1,47 @@
+name: Music Assistant (Spotify)
+version: "0.1.0"
+slug: music_assistant
+description: Music Assistant with configurable Spotify request routing and request statistics.
+url: https://github.com/KlaysDe/music-assistant-server/tree/ha-store/music_assistant
+arch:
+  - amd64
+  - aarch64
+boot: manual
+homeassistant_api: true
+hassio_api: true
+hassio_role: manager
+discovery:
+  - music_assistant
+  - mcp
+auth_api: true
+host_network: true
+ingress: true
+ingress_port: 8094
+audio: true
+panel_icon: mdi:music-assistant
+panel_title: Music Assistant (Spotify)
+panel_admin: false
+apparmor: true
+map:
+  - type: media
+    read_only: false
+  - type: ssl
+    read_only: true
+init: false
+stage: experimental
+tmpfs: true
+backup_exclude:
+  - cache.db
+  - collage_images/*
+  - .cache/*
+  - .corepack/*
+  - .pnpm-store/*
+  - frontend-build/*
+  - server-build-tmp/*
+  - library.db.backup
+options:
+  log_level: info
+  safe_mode: false
+schema:
+  log_level: list(debug|info|warning|error)
+  safe_mode: bool
