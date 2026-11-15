@@ -264,10 +264,10 @@ async def test_browse_dispatches_to_helpers(
     monkeypatch.setattr(provider, "_get_category_playlists", get_category_playlists)
 
     assert await provider.browse("spotify--test://new-releases") is new_releases
-    get_new_releases.assert_awaited_once_with()
+    get_new_releases.assert_awaited_once_with(prefer_developer=False)
 
     assert await provider.browse("spotify--test://categories") is folders
-    get_categories.assert_awaited_once_with("de_DE")
+    get_categories.assert_awaited_once_with("de_DE", prefer_developer=False)
 
     assert await provider.browse("spotify--test://categories/pop") is playlists
     get_category_playlists.assert_awaited_once_with("pop", "de_DE")
