@@ -1,5 +1,6 @@
 import ProviderSaveErrorDialog from "@/components/ProviderSaveErrorDialog.vue";
 import ProviderMaintainerMarker from "@/components/settings/providers/ProviderMaintainerMarker.vue";
+import { Dialog } from "@/components/ui/dialog";
 import type { ContextMenuItem } from "@/helpers/context_menu_item";
 import { flushPromises, shallowMount, type VueWrapper } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -253,6 +254,62 @@ describe("EditProvider", () => {
     expect(wrapper.findComponent(ProviderMaintainerMarker).exists()).toBe(
       false,
     );
+  });
+
+  it("opens Spotify stats in the provider header without leaving settings", async () => {
+    const config = spotifyConfig(ProviderStatus.LOADED);
+    config.values.open_stats = {
+      key: "open_stats",
+      action: "open_stats",
+      type: ConfigEntryType.ACTION,
+      label: "Statistik öffnen",
+      default_value: null,
+      required: false,
+      options: [],
+      category: "",
+    };
+    const statsPath =
+      "/example-ingress/spotify/stats/spotify--test/#test-grant";
+    const statsUrl = new URL(statsPath, window.location.href).href;
+    apiMock.invokeProviderConfigAction
+      .mockResolvedValueOnce({
+        open_url: `https://another-host.example${statsPath}`,
+        message: null,
+      })
+      .mockResolvedValueOnce({ open_url: statsUrl, message: null });
+    const wrapper = await mountProvider(config, {
+      SpotifyStatsDialog: false,
+      Dialog: SlotStub,
+      DialogTrigger: SlotStub,
+      DialogContent: SlotStub,
+    });
+
+    const help = wrapper.get('[data-testid="provider-get-help"]');
+    const stats = wrapper.get('[data-testid="provider-spotify-stats"]');
+    expect(help.element.parentElement?.contains(stats.element)).toBe(true);
+    expect(
+      wrapper.findComponent({ name: "EditConfig" }).props("configEntries"),
+    ).not.toContainEqual(config.values.open_stats);
+
+    await stats.trigger("click");
+    await flushPromises();
+    expect(wrapper.find("iframe").exists()).toBe(false);
+    expect(toastMock.error).toHaveBeenCalledWith(
+      "settings.spotify_stats_unavailable",
+    );
+
+    await stats.trigger("click");
+    await flushPromises();
+    expect(apiMock.invokeProviderConfigAction).toHaveBeenCalledWith(
+      "spotify--test",
+      "open_stats",
+    );
+    expect(wrapper.get("iframe").attributes("src")).toBe(statsUrl);
+    expect(routerMock.push).not.toHaveBeenCalled();
+
+    wrapper.findComponent(Dialog).vm.$emit("update:open", false);
+    await flushPromises();
+    expect(wrapper.find("iframe").exists()).toBe(false);
   });
 
   it("marks a community provider, names its maintainers and sends Get help to them", async () => {

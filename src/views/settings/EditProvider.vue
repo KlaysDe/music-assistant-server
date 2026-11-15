@@ -203,6 +203,13 @@
             <LifeBuoy class="size-4" />
             {{ $t("settings.provider_get_help") }}
           </Button>
+          <SpotifyStatsDialog
+            v-if="config.enabled && spotifyStatsAction?.action"
+            :key="config.instance_id"
+            :instance-id="config.instance_id"
+            :action="spotifyStatsAction.action"
+            :label="spotifyStatsAction.label || $t('statistics')"
+          />
         </CardContent>
       </Card>
 
@@ -222,7 +229,7 @@
     <edit-config
       v-if="config"
       ref="editConfig"
-      :config-entries="allConfigEntries"
+      :config-entries="optionEntries"
       :disabled="!config.enabled"
       :provider-domain="config.domain"
       @submit="onSubmit"
@@ -300,6 +307,7 @@ import ProviderSaveErrorDialog from "@/components/ProviderSaveErrorDialog.vue";
 import ProviderAccessDialog from "@/components/settings/providers/ProviderAccessDialog.vue";
 import ProviderMaintainerMarker from "@/components/settings/providers/ProviderMaintainerMarker.vue";
 import ProviderSettingsLinks from "@/components/settings/providers/ProviderSettingsLinks.vue";
+import SpotifyStatsDialog from "@/components/settings/providers/SpotifyStatsDialog.vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -334,6 +342,7 @@ import { getProviderSettingsMenuItems } from "@/helpers/provider_settings_action
 import { getExternalLinkUrl, markdownToHtml } from "@/helpers/utils";
 import { api } from "@/plugins/api";
 import {
+  ConfigEntryType,
   ConfigValueType,
   EventType,
   ProviderConfig,
@@ -397,10 +406,19 @@ const props = defineProps<{
 }>();
 
 // computed properties
-const allConfigEntries = computed(() => {
-  if (!config.value) return [];
-  return Object.values(config.value.values);
+const spotifyStatsAction = computed(() => {
+  if (config.value?.domain !== "spotify") return undefined;
+  const entry = config.value.values.open_stats;
+  return entry?.type === ConfigEntryType.ACTION && entry.action && !entry.hidden
+    ? entry
+    : undefined;
 });
+
+const optionEntries = computed(() =>
+  Object.values(config.value?.values ?? {}).filter(
+    (entry) => entry !== spotifyStatsAction.value,
+  ),
+);
 
 const providerManifest = computed(() => {
   if (!config.value) return undefined;
