@@ -22,9 +22,9 @@ from typing import Any
 SERVER_REPOSITORY = "KlaysDe/music-assistant-server"
 UPSTREAM_SERVER = "music-assistant/server"
 UPSTREAM_FRONTEND = "music-assistant/frontend"
-SERVER_PATCH_REF = "refs/heads/spotify-archive-playlist-test"
+SERVER_PATCH_REF = "refs/heads/spotify-archive-stats-theme"
 SERVER_PATCH_BASE = "8f2346bb952576849460f0d00da73a9a40fc136d"
-SERVER_PATCH_HEAD = "796d340cd645f8fe5226692e9bfc6b37dce0016d"
+SERVER_PATCH_HEAD = "a2c7e58ca17fc7721291229aa993947313293095"
 SERVER_PATCHES = (
     "9ca1bd50bf351686d75840f7e1b2e03d6060ad60",
     "456d6625d487bc9d80cf99a3df1b00f362ef3d0b",
@@ -35,6 +35,7 @@ SERVER_PATCHES = (
     "48c87218ff413427af11341723f987637e69aad0",
     "c8a47f398177d211bff6d3c722c5ce2889ec694c",
     "796d340cd645f8fe5226692e9bfc6b37dce0016d",
+    "a2c7e58ca17fc7721291229aa993947313293095",
 )
 FRONTEND_PATCH_REF = "refs/heads/spotify-stats-frontend"
 FRONTEND_PATCH_BASE = "ef6a9ad01adfaba0506dd5d550791305470472ab"
