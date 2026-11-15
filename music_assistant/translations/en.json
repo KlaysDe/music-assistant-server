@@ -2708,6 +2708,7 @@
   "provider.spotify.config_entries.playback_backend.options.librespot": "librespot (community)",
   "provider.spotify.config_entries.playback_backend.options.soloist": "Spotify Soloist (official)",
   "provider.spotify.config_entries.playback_callback_url.label": "Address of the error page",
+  "provider.spotify.config_entries.open_stats.label": "Open stats",
   "provider.spotify.config_entries.prefer_developer_app.description": "Use your Client ID for playlist sync, Artist Top Tracks, Genres & Moods categories, and New Releases when possible. Spotify may omit its mixes from playlist sync. Existing playlists are kept until a full sync using the shared app.",
   "provider.spotify.config_entries.prefer_developer_app.label": "Prefer my Spotify app",
   "provider.spotify.config_entries.soloist_api_key.label": "Soloist API key",

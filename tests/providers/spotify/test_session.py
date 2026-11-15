@@ -1,5 +1,6 @@
 """Tests for the request handling of a Spotify Web API session."""
 
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,20 +12,24 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.helpers.throttle_retry import ThrottlerManager
+from music_assistant.providers.spotify.request_stats import SpotifyRequestStats
 from music_assistant.providers.spotify.session import API_URL, SpotifySession
 
 
-def _make_session() -> SpotifySession:
+def _make_session(
+    name: str = "global", request_stats: SpotifyRequestStats | None = None
+) -> SpotifySession:
     """Return a session with a mocked http layer and a throttler that never holds back."""
     mass = MagicMock()
     mass.metadata.locale = "en_US"
     return SpotifySession(
         mass,
-        MagicMock(),
-        "global",
+        logging.getLogger(__name__),
+        name,
         ThrottlerManager(rate_limit=100, period=1),
         get_auth=AsyncMock(return_value={"access_token": "token"}),
         on_unauthorized=MagicMock(),
+        request_stats=request_stats,
     )
 
 
@@ -66,6 +71,40 @@ async def test_rate_limit_carries_the_retry_after() -> None:
         async with session._request("GET", "me"):
             pass
     assert err.value.backoff_time == 42
+
+
+async def test_request_stats_count_actual_attempts_for_each_token(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Record the real sessions, without recording catalog IDs or query strings."""
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr("music_assistant.providers.spotify.request_stats.time.time", lambda: 90_000)
+    stats = SpotifyRequestStats()
+    developer = _make_session("dev", stats)
+    shared = _make_session("global", stats)
+    _stub_response(developer, 429, headers={"Retry-After": "42"})
+    _stub_response(shared, 200)
+    endpoint = "artists/private-id/top-tracks?key=private-query"
+
+    with pytest.raises(RateLimited):
+        async with developer._request("GET", endpoint):
+            pytest.fail("The rate limit response should not be yielded")
+    async with shared._request("GET", endpoint):
+        pass
+
+    rows = stats.snapshot(15)["rows"]
+    assert isinstance(rows, list)
+    assert [(row["token"], row["requests"], row["rate_limited"]) for row in rows] == [
+        ("developer-token", 1, 1),
+        ("music-assistant", 1, 0),
+    ]
+    assert {row["endpoint"] for row in rows} == {"GET /artists/:id/top-tracks"}
+    assert rows[0]["max_retry_after"] == 42
+    assert "developer-token GET /artists/:id/top-tracks" in caplog.text
+    assert "music-assistant GET /artists/:id/top-tracks" in caplog.text
+    assert "private-id" not in caplog.text
+    assert "private-query" not in caplog.text
 
 
 async def test_unauthorized_drops_the_token() -> None:
