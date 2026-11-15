@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -17,17 +18,23 @@ from orjson import JSONDecodeError
 
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.throttle_retry import (
+    MAX_RETRY_AFTER,
     RequestPriority,
     ThrottlerManager,
     current_priority,
+    current_throttle_delay,
     parse_retry_after,
     throttle_with_retries,
 )
+
+from .request_stats import DEVELOPER_LABEL, MUSIC_ASSISTANT_LABEL, endpoint_label
 
 if TYPE_CHECKING:
     import logging
 
     from music_assistant.mass import MusicAssistant
+
+    from .request_stats import SpotifyRequestStats
 
 API_URL = "https://api.spotify.com/v1"
 
@@ -48,6 +55,7 @@ class SpotifySession:
         get_auth: Callable[[], Awaitable[dict[str, Any]]],
         on_unauthorized: Callable[[], None],
         fallback_for_playback: bool = False,
+        request_stats: SpotifyRequestStats | None = None,
     ) -> None:
         """
         Initialize the session.
@@ -60,14 +68,17 @@ class SpotifySession:
         :param on_unauthorized: Called when Spotify rejects the access token of this session.
         :param fallback_for_playback: Whether another session serves playback while this one is
             rate limited, so a playback request gives up on a limit at once.
+        :param request_stats: Optional request history for this provider instance.
         """
         self.mass = mass
-        self.logger = logger
         self.name = name
+        self.token_label = DEVELOPER_LABEL if name == "dev" else MUSIC_ASSISTANT_LABEL
+        self.logger = logger.getChild(self.token_label)
         self.throttler = throttler
         self._get_auth = get_auth
         self._on_unauthorized = on_unauthorized
         self._fallback_for_playback = fallback_for_playback
+        self._request_stats = request_stats
 
     @throttle_with_retries
     async def get(
@@ -86,7 +97,6 @@ class SpotifySession:
         locale = self.mass.metadata.locale.replace("_", "-")
         language = locale.split("-")[0]
         headers = {"Accept-Language": f"{locale}, {language};q=0.9, *;q=0.5"}
-        self.logger.debug("handling get data %s/%s with kwargs %s", API_URL, endpoint, params)
         async with self._request(
             "GET",
             endpoint,
@@ -104,7 +114,7 @@ class SpotifySession:
 
                 self.logger.debug(
                     "Spotify API error: endpoint=%s, status=%s, reason=%s, message=%s",
-                    endpoint,
+                    endpoint_label("GET", endpoint),
                     response.status,
                     response.reason,
                     message,
@@ -214,26 +224,58 @@ class SpotifySession:
         if not auth_info:
             auth_info = await self._get_auth()
         headers = {**(headers or {}), "Authorization": f"Bearer {auth_info['access_token']}"}
-        async with self.mass.http_session.request(
-            method, f"{API_URL}/{endpoint}", headers=headers, **kwargs
-        ) as response:
-            # handle spotify rate limiter
-            if response.status == 429:
-                backoff_time = parse_retry_after(response.headers.get("Retry-After"))
-                if self._fallback_for_playback and current_priority() is RequestPriority.HIGH:
-                    # playback does not sit out a limit of this app while another session can
-                    # serve it: close the gate for the time asked and give up right away
-                    self.throttler.set_cooldown(max(backoff_time, self.throttler.initial_backoff))
-                    raise RetriesExhausted(
-                        "Spotify Rate Limiter", translation_key=RateLimited.translation_key
-                    )
-                raise RateLimited("Spotify Rate Limiter", backoff_time=backoff_time)
-            # handle token expired, raise ResourceTemporarilyUnavailable
-            # so it will be retried (and the token refreshed)
-            if response.status == 401:
-                self._on_unauthorized()
-                raise ResourceTemporarilyUnavailable("Token expired", backoff_time=1)
-            # handle temporary server error
-            if response.status in (502, 503):
-                raise ResourceTemporarilyUnavailable(backoff_time=30)
-            yield response
+        route = endpoint_label(method, endpoint)
+        started = time.monotonic()
+        status = 0
+        try:
+            async with self.mass.http_session.request(
+                method, f"{API_URL}/{endpoint}", headers=headers, **kwargs
+            ) as response:
+                status = response.status
+                backoff_time = (
+                    parse_retry_after(response.headers.get("Retry-After")) if status == 429 else 0
+                )
+                self._record_attempt(route, status, started, backoff_time)
+                if status == 429:
+                    if self._fallback_for_playback and current_priority() is RequestPriority.HIGH:
+                        # playback does not sit out a limit while another session can serve it
+                        self.throttler.set_cooldown(
+                            max(backoff_time, self.throttler.initial_backoff)
+                        )
+                        raise RetriesExhausted(
+                            "Spotify Rate Limiter", translation_key=RateLimited.translation_key
+                        )
+                    raise RateLimited("Spotify Rate Limiter", backoff_time=backoff_time)
+                # handle token expired and server errors through the existing retry policy
+                if status == 401:
+                    self._on_unauthorized()
+                    raise ResourceTemporarilyUnavailable("Token expired", backoff_time=1)
+                if status in (502, 503):
+                    raise ResourceTemporarilyUnavailable(backoff_time=30)
+                yield response
+        except aiohttp.ClientError, TimeoutError:
+            if not status:
+                self._record_attempt(route, status, started, 0)
+            raise
+
+    def _record_attempt(self, route: str, status: int, started: float, retry_after: int) -> None:
+        """Log and count an attempt once, before any retry or fallback."""
+        elapsed = time.monotonic() - started
+        wait = current_throttle_delay()
+        self.logger.debug(
+            "Spotify Web API %s %s → %s (%.0f ms response, %.0f ms throttle wait, %s priority)",
+            self.token_label,
+            route,
+            status or "transport error",
+            elapsed * 1000,
+            wait * 1000,
+            current_priority().name.lower(),
+        )
+        if status == 429:
+            self.logger.info(
+                "%s %s: HTTP 429, Retry-After %ss", self.token_label, route, retry_after
+            )
+        if self._request_stats is not None:
+            self._request_stats.record(
+                self.token_label, route, status, wait, elapsed, min(retry_after, MAX_RETRY_AFTER)
+            )
