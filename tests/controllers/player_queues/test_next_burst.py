@@ -24,6 +24,8 @@ def _controller() -> PlayerQueuesController:
             queue=PlayerQueue(
                 queue_id=queue_id,
                 display_name=queue_id,
+                available=True,
+                items=10,
                 active=True,
                 current_index=0,
                 state=PlaybackState.PLAYING,
