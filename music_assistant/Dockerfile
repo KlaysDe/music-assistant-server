@@ -1,3 +1,3 @@
 FROM ghcr.io/music-assistant/server:dev@sha256:6f3d20c5bac6fb9f08b40f5733a0df1f843862a92d147572a9ed7e4a15594cd9
-ENV SERVER_REPO=KlaysDe/music-assistant-server@92cf0992adab5d97ef78958185d4da9adf64ab44
+ENV SERVER_REPO=KlaysDe/music-assistant-server@6c40811d61b0f735971409228e5e960bc423634d
 ENV FRONTEND_REPO=KlaysDe/music-assistant-server@033d78bcf1a7e1dd63c3df172f21863e0e9a4424
