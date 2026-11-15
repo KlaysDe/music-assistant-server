@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Configuration Keys
 CONF_CLIENT_ID = "client_id"
+CONF_PREFER_DEVELOPER_APP = "prefer_developer_app"
 # Legacy key for migration, will be removed
 CONF_REFRESH_TOKEN_DEPRECATED = "refresh_token"  # noqa: S105 - config key
 # Token authenticated with MA's client ID
