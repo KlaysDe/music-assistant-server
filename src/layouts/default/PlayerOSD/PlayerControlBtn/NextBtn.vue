@@ -20,7 +20,10 @@
 defineOptions({ inheritAttrs: false });
 import Icon, { IconProps } from "@/components/Icon.vue";
 import { useActiveAudioSource } from "@/composables/activeAudioSource";
-import { useActiveSource } from "@/composables/activeSource";
+import {
+  resolveActiveSourceId,
+  useActiveSource,
+} from "@/composables/activeSource";
 import { useChapterNavigation } from "@/composables/useChapterNavigation";
 import api from "@/plugins/api";
 import { Player, PlayerFeature, PlayerQueue } from "@/plugins/api/interfaces";
@@ -75,9 +78,19 @@ const canNext = computed(() => {
 });
 
 const isLoading = computed(() => {
-  if (!compProps.player) return false;
-  return (
-    compProps.playerQueue?.extra_attributes?.play_action_in_progress === true
-  );
+  const { player, playerQueue } = compProps;
+  if (
+    !player ||
+    playerQueue?.extra_attributes?.play_action_in_progress !== true
+  ) {
+    return false;
+  }
+  // Keep sending queue skips while the server is handling earlier presses.
+  const isQueueSkip =
+    queueHasNext.value &&
+    resolveActiveSourceId(player) === playerQueue.queue_id &&
+    !nextChapter.value &&
+    !activeAudioSource.value;
+  return !isQueueSkip;
 });
 </script>
