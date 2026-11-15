@@ -164,6 +164,22 @@ class MigrateBackupTest(unittest.TestCase):
         self.assertEqual(files[SESSION], SOURCE_FILES[SESSION])
         self.assertEqual(files["apparmor.txt"], b"target-profile")
 
+    def test_omits_source_pnpm_build_cache_with_a_symlink(self):
+        project = tarfile.TarInfo("./data/.pnpm-store/v11/projects/frontend")
+        project.type = tarfile.SYMTYPE
+        project.linkname = "../../../frontend-build"
+        _make_backup(
+            self.source, DEV_APP,
+            SOURCE_FILES | {"data/.pnpm-store/v11/cache": b"build cache"},
+            extra_member=project,
+        )
+        _make_backup(self.target, TARGET, TARGET_FILES)
+        migrate_backup(self.source, self.target, self.output, TARGET)
+        with tarfile.open(self.output, "r:") as outer:
+            with tarfile.open(fileobj=outer.extractfile(f"./{TARGET}.tar")) as inner:
+                self.assertFalse(any(".pnpm-store" in item for item in inner.getnames()))
+                self.assertEqual(_files(inner)[SESSION], SOURCE_FILES[SESSION])
+
     def test_rejects_live_or_nonempty_target(self):
         _make_backup(self.source, DEV_APP, SOURCE_FILES)
         _make_backup(self.target, TARGET, TARGET_FILES, state="started")

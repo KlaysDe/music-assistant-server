@@ -27,6 +27,7 @@ from typing import Any
 
 DEV_APP = "d5369777_music_assistant_dev"
 OPTIONS = "data/options.json"
+PNPM_STORE = PurePosixPath("data/.pnpm-store")
 APP_METADATA = {".", "addon.json", "apparmor.txt", "image.tar"}
 APP_ID = re.compile(r"([0-9a-f]{8}|local)_([a-z0-9][a-z0-9_-]*)")
 JSON_LIMIT = 32 * 1024 * 1024
@@ -49,7 +50,9 @@ class AppBackup:
         return self.manifest["compressed"]
 
 
-def _members(archive: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
+def _members(
+    archive: tarfile.TarFile, *, exclude: PurePosixPath | None = None
+) -> dict[str, tarfile.TarInfo]:
     members = {}
     for member in archive:
         path = PurePosixPath(member.name)
@@ -59,7 +62,12 @@ def _members(archive: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
             or ".." in path.parts
             or "\\" in member.name
             or any(":" in part for part in path.parts)
-            or not (member.isfile() or member.isdir())
+        ):
+            raise BackupError("An archive contains an unsafe path.")
+        if exclude is not None and path.is_relative_to(exclude):
+            continue
+        if (
+            not (member.isfile() or member.isdir())
             or member.issparse()
             or (name == "." and not member.isdir())
             or name in members
@@ -119,7 +127,8 @@ def _open_backup(
     inner_stream = stack.enter_context(outer.extractfile(app_member))
     mode = "r:gz" if manifest["compressed"] else "r:"
     inner = stack.enter_context(tarfile.open(fileobj=inner_stream, mode=mode))
-    members = _members(inner)
+    # The DEV installer recreates its package store, including its build-directory symlink.
+    members = _members(inner, exclude=PNPM_STORE if app_id == DEV_APP else None)
     addon = _read_json(inner, members.get("addon.json"), "App metadata")
     system = addon.get("system")
     user = addon.get("user")
