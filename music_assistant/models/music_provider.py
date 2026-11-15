@@ -134,8 +134,7 @@ class SyncRunState:
     """
     State of one library sync run.
 
-    :param incomplete_media_types: Media types the run failed to collect an item for, which
-        makes their result set an unsafe basis for deleting anything from the library.
+    :param incomplete_media_types: Media types for which the run lacks a complete listing.
     :param failures: Number of item failures reported by the run so far.
     :param skipped_item_ids: Provider item id's the provider dropped while listing its
         library, per media type.
@@ -1384,7 +1383,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         if media_type in sync_state.incomplete_media_types:
             # a skipped item is missing from cur_db_ids just like a deleted one, but it is
             # still in the provider's library, so deleting it would throw away valid content
-            if self.library_sync_deletions_enabled():
+            if sync_state.failures and self.library_sync_deletions_enabled():
                 summary = f"{sync_state.failures} item(s) could not be synced"
                 self.logger.warning("Skipping deletions for %s: %s", self.name, summary)
                 report_current_task_failure(f"Deletions skipped: {summary}")

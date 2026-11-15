@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import (
     LoginFailed,
     RateLimited,
@@ -13,8 +14,13 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.helpers.throttle_retry import RequestPriority, request_priority
+from music_assistant.models.music_provider import SYNC_RUN_STATE, SyncRunState
 from music_assistant.providers.spotify import provider as provider_module
-from music_assistant.providers.spotify.constants import CONF_CLIENT_ID, CONF_REFRESH_TOKEN_DEV
+from music_assistant.providers.spotify.constants import (
+    CONF_CLIENT_ID,
+    CONF_PREFER_DEVELOPER_APP,
+    CONF_REFRESH_TOKEN_DEV,
+)
 from music_assistant.providers.spotify.provider import SpotifyProvider
 
 INSTANCE_ID = "spotify--test"
@@ -148,6 +154,72 @@ async def test_request_forced_on_the_global_session() -> None:
 
     await provider._get_data("playlists/abc", use_global_session=True)
     assert _tokens_used(request) == ["global"]
+
+
+@pytest.mark.parametrize(("dev_status", "tokens"), [(200, ["dev"]), (403, ["dev", "global"])])
+async def test_preferred_catalog_read(dev_status: int, tokens: list[str]) -> None:
+    """Use the custom app and try the shared app once if Spotify rejects that read."""
+    provider = await _make_provider()
+    request = _stub_http(provider, {})
+
+    def respond(*_args: Any, **kwargs: Any) -> MagicMock:
+        status = dev_status if kwargs["headers"]["Authorization"] == "Bearer dev" else 200
+        response = MagicMock(status=status, reason=str(status), headers={})
+        response.json = AsyncMock(return_value={})
+        return MagicMock(
+            __aenter__=AsyncMock(return_value=response), __aexit__=AsyncMock(return_value=None)
+        )
+
+    request.side_effect = respond
+    await provider._get_curated_data("browse/categories", prefer_developer=True)
+    assert _tokens_used(request) == tokens
+
+
+@pytest.mark.parametrize("reject_second_page", [False, True])
+async def test_preferred_playlist_listing_restarts_or_preserves_omitted_playlists(
+    reject_second_page: bool,
+) -> None:
+    """Keep developer pages together and protect entries omitted by a partial listing."""
+    provider = await _make_provider()
+    provider.config.values = {}
+    provider.config.get_value.side_effect = lambda key, default: (
+        key == CONF_PREFER_DEVELOPER_APP or default
+    )
+    request = _stub_http(provider, {})
+
+    def respond(*_args: Any, **kwargs: Any) -> MagicMock:
+        developer = kwargs["headers"]["Authorization"] == "Bearer dev"
+        offset = kwargs["params"]["offset"]
+        playlist = f"dev-{offset}" if developer else "shared-only"
+        status = 403 if developer and offset and reject_second_page else 200
+        payload = {"items": [{"id": playlist}], "total": 51 if developer else 1}
+        response = MagicMock(status=status, reason=str(status), headers={})
+        response.json = AsyncMock(return_value=payload)
+        return MagicMock(
+            __aenter__=AsyncMock(return_value=response), __aexit__=AsyncMock(return_value=None)
+        )
+
+    request.side_effect = respond
+    state = SyncRunState()
+    token = SYNC_RUN_STATE.set(state)
+    try:
+        with (
+            patch.object(provider, "_get_liked_songs_playlist", return_value="liked"),
+            patch.object(provider_module, "parse_playlist", side_effect=lambda item, _: item["id"]),
+        ):
+            playlists = [item async for item in provider.get_library_playlists()]
+    finally:
+        SYNC_RUN_STATE.reset(token)
+
+    if reject_second_page:
+        assert playlists == ["liked", "shared-only"]
+        assert _tokens_used(request) == ["dev", "dev", "global"]
+        assert [call.kwargs["params"]["offset"] for call in request.call_args_list] == [0, 50, 0]
+        assert MediaType.PLAYLIST not in state.incomplete_media_types
+    else:
+        assert playlists == ["liked", "dev-0", "dev-50"]
+        assert _tokens_used(request) == ["dev", "dev"]
+        assert MediaType.PLAYLIST in state.incomplete_media_types
 
 
 @pytest.mark.parametrize("priority", [RequestPriority.NORMAL, RequestPriority.HIGH])

@@ -73,6 +73,7 @@ from music_assistant.helpers.throttle_retry import (
 from music_assistant.helpers.util import lock
 from music_assistant.models.music_provider import (
     ARTIST_ALBUMS_LIMIT,
+    SYNC_RUN_STATE,
     MusicProvider,
     ProviderStreamLimitError,
 )
@@ -96,6 +97,7 @@ from .constants import (
     CONF_AUDIOBOOKS_SUPPORTED,
     CONF_CLIENT_ID,
     CONF_PLAYBACK_BACKEND,
+    CONF_PREFER_DEVELOPER_APP,
     CONF_REFRESH_TOKEN_DEV,
     CONF_REFRESH_TOKEN_GLOBAL,
     CONF_SPOTIFY_NORMALIZATION,
@@ -163,6 +165,13 @@ class SpotifyProvider(MusicProvider):
         audiobooks_supported = bool(getattr(self, "audiobooks_supported", False))
         return (
             CONF_ENTRY_UNOFFICIAL_PROVIDER,
+            ConfigEntry(
+                key=CONF_PREFER_DEVELOPER_APP,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                hidden=not bool(self.get_setup_value(CONF_CLIENT_ID)),
+            ),
             ConfigEntry(
                 key=CONF_SPOTIFY_NORMALIZATION,
                 type=ConfigEntryType.BOOLEAN,
@@ -442,13 +451,28 @@ class SpotifyProvider(MusicProvider):
                 yield audiobook
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
-        """
-        Retrieve playlists from the provider.
-
-        Note: We use the global session here because playlists like "Daily Mix"
-        are only returned when using the non-dev (global) token.
-        """
+        """Retrieve playlists from the provider."""
         yield await self._get_liked_songs_playlist()
+        if self._prefer_developer_app and self._session_for(False) is self._dev_session:
+            try:
+                playlists = [
+                    item
+                    async for item in self._get_all_items(
+                        "me/playlists", use_cache=False, get_uncached_page=self._dev_session.get
+                    )
+                ]
+            except LoginFailed, MediaNotFoundError, RetriesExhausted:
+                self.logger.debug("Retrying playlist listing from the start on the shared app")
+            else:
+                # Spotify can omit its own mixes from a successful developer listing.
+                if (sync_state := SYNC_RUN_STATE.get()) is not None:
+                    sync_state.incomplete_media_types.add(MediaType.PLAYLIST)
+                self.logger.debug("Using developer playlist list without reconciling removals")
+                for item in playlists:
+                    if item.get("id"):
+                        yield parse_playlist(item, self)
+                return
+
         # the page cache only checks the first playlist for changes, so it would miss a
         # rename or new cover of any playlist further down the list
         async for item in self._get_all_items(
@@ -469,13 +493,13 @@ class SpotifyProvider(MusicProvider):
         locale = self.mass.metadata.locale
 
         if subpath == "new-releases":
-            return await self._get_new_releases()
+            return await self._get_new_releases(prefer_developer=self._prefer_developer_app)
 
         if subpath == "categories" and sub_subpath:
             return await self._get_category_playlists(sub_subpath, locale)
 
         if subpath == "categories":
-            return await self._get_categories(locale)
+            return await self._get_categories(locale, prefer_developer=self._prefer_developer_app)
 
         # For root path, add curated folders on top of standard library folders.
         # At the root the path always ends in "://", so curated paths can be appended directly.
@@ -885,29 +909,9 @@ class SpotifyProvider(MusicProvider):
             return []
         return albums
 
-    @use_cache(
-        86400 * 14,  # 14 days
-        cache_checksum="global_session_v1",
-        allow_expired_cache=True,
-    )
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of 10 most popular tracks for the given artist."""
-        try:
-            artist = await self.get_artist(prov_artist_id)
-            endpoint = f"artists/{prov_artist_id}/top-tracks"
-            # top tracks are not available to developer apps
-            items = await self._get_data(endpoint, use_global_session=True)
-            return [
-                parse_track(item, self, artist=artist)
-                for item in items["tracks"]
-                if (item and item["id"])
-            ]
-        except MediaNotFoundError:
-            self.logger.warning(
-                "Top tracks search for artist %s appears to have been removed by Spotify for this account.",
-                prov_artist_id,
-            )
-            return []
+        return await self._get_artist_toptracks(prov_artist_id, self._prefer_developer_app)
 
     async def library_add(self, item: MediaItemType) -> bool:
         """Add item to library."""
@@ -1525,16 +1529,43 @@ class SpotifyProvider(MusicProvider):
     def _get_liked_songs_playlist_id(self) -> str:
         return f"{LIKED_SONGS_FAKE_PLAYLIST_ID_PREFIX}-{self.instance_id}"
 
+    @property
+    def _prefer_developer_app(self) -> bool:
+        """Return whether the configured developer session should serve more reads."""
+        return (
+            self.dev_session_active
+            and self.get_config_value(CONF_PREFER_DEVELOPER_APP, False) is True
+        )
+
+    @use_cache(86400 * 14, allow_expired_cache=True)
+    async def _get_artist_toptracks(self, artist_id: str, prefer_developer: bool) -> list[Track]:
+        """Get and cache Spotify's top tracks using the selected routing policy."""
+        try:
+            artist = await self.get_artist(artist_id)
+            items = await self._get_curated_data(
+                f"artists/{artist_id}/top-tracks", prefer_developer
+            )
+            return [
+                parse_track(item, self, artist=artist)
+                for item in items["tracks"]
+                if item and item["id"]
+            ]
+        except MediaNotFoundError:
+            self.logger.warning(
+                "Top tracks search for artist %s appears to have been removed by Spotify for this account.",
+                artist_id,
+            )
+            return []
+
     @use_cache(
         86400,  # 24h; serve stale + refresh in background
         cache_checksum="global_session_v1",
         allow_expired_cache=True,
     )
-    async def _get_new_releases(self) -> list[Album]:
+    async def _get_new_releases(self, *, prefer_developer: bool = False) -> list[Album]:
         """Get Spotify's curated 'new releases' albums."""
         try:
-            # new releases are not available to developer apps
-            result = await self._get_data("browse/new-releases", limit=50, use_global_session=True)
+            result = await self._get_curated_data("browse/new-releases", prefer_developer, limit=50)
         except MediaNotFoundError:
             return []
         return [
@@ -1548,12 +1579,13 @@ class SpotifyProvider(MusicProvider):
         cache_checksum="global_session_v1",
         allow_expired_cache=True,
     )
-    async def _get_categories(self, locale: str) -> list[BrowseFolder]:
+    async def _get_categories(
+        self, locale: str, *, prefer_developer: bool = False
+    ) -> list[BrowseFolder]:
         """Get Spotify's curated browse categories (genres & moods) as browse folders."""
         try:
-            # browse categories are not available to developer apps
-            result = await self._get_data(
-                "browse/categories", locale=locale, limit=50, use_global_session=True
+            result = await self._get_curated_data(
+                "browse/categories", prefer_developer, locale=locale, limit=50
             )
         except MediaNotFoundError:
             return []
@@ -1832,6 +1864,8 @@ class SpotifyProvider(MusicProvider):
         key: str = "items",
         limit: int = 50,
         use_cache: bool = True,
+        *,
+        get_uncached_page: Callable[..., Awaitable[dict[str, Any]]] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any]]:
         """
@@ -1842,6 +1876,7 @@ class SpotifyProvider(MusicProvider):
         :param limit: Number of items to request per page.
         :param use_cache: Serve pages from the page cache, at the cost of one extra request that
             checks the list for changes; when False, every page is requested from the API.
+        :param get_uncached_page: Optional request function for uncached pages.
         """
         offset = 0
         cache_checksum: str | None = None
@@ -1861,7 +1896,8 @@ class SpotifyProvider(MusicProvider):
                     endpoint, cache_checksum=cache_checksum, limit=limit, offset=offset, **kwargs
                 )
             else:
-                result = await self._get_data(endpoint, limit=limit, offset=offset, **kwargs)
+                get_page = get_uncached_page or self._get_data
+                result = await get_page(endpoint, limit=limit, offset=offset, **kwargs)
                 total = result.get("total", 0)
             offset += limit
             if not result or key not in result or not result[key]:
@@ -1906,6 +1942,16 @@ class SpotifyProvider(MusicProvider):
         """Get etag and total item count for a paginated api endpoint."""
         _res = await self._get_data(endpoint, **kwargs)
         return {"etag": _res.get("etag"), "total": _res.get("total", 0)}
+
+    async def _get_curated_data(
+        self, endpoint: str, prefer_developer: bool, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Use the shared session if the selected developer session lacks a curated read."""
+        if not prefer_developer:
+            return await self._get_data(endpoint, use_global_session=True, **kwargs)
+        return await self._request_on_session(
+            False, lambda session: session.get(endpoint, **kwargs), fallback_on_not_found=True
+        )
 
     async def _get_data(self, endpoint: str, **kwargs: Any) -> dict[str, Any]:
         """
@@ -1966,17 +2012,27 @@ class SpotifyProvider(MusicProvider):
             raise InvalidDataError(msg) from err
 
     async def _request_on_session[T](
-        self, use_global_session: bool, request: Callable[[SpotifySession], Awaitable[T]]
+        self,
+        use_global_session: bool,
+        request: Callable[[SpotifySession], Awaitable[T]],
+        *,
+        fallback_on_not_found: bool = False,
     ) -> T:
         """
         Run an api request on the session that should serve it.
 
         :param use_global_session: Force use of global session (for features not available on dev).
         :param request: Sends the request on the given session.
+        :param fallback_on_not_found: Retry selected developer reads on the shared session.
         """
         session = self._session_for(use_global_session)
         try:
             return await request(session)
+        except MediaNotFoundError:
+            if not fallback_on_not_found or session is not self._dev_session:
+                raise
+            self.logger.debug("Retrying unavailable developer read on the shared app")
+            return await request(self._global_session)
         except LoginFailed:
             if session is not self._dev_session:
                 raise
