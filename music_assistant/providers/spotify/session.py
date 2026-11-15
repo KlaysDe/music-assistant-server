@@ -261,6 +261,7 @@ class SpotifySession:
                 translation_key=RateLimited.translation_key,
             )
         route = endpoint_label(method, endpoint)
+        self.logger.debug("Spotify Web API %s %s started", self.token_label, route)
         started = time.monotonic()
         status = 0
         try:
