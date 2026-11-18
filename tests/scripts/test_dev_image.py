@@ -253,7 +253,7 @@ def test_dev_image_resolve_and_check_need_no_write_access() -> None:
         assert job["timeout-minutes"] > 0
         # a pull request from a fork has no token to log in with
         assert not any("login-action" in step.get("uses", "") for step in job["steps"])
-    assert "if" not in resolve
+    assert resolve["if"] == "github.repository == 'music-assistant/server'"
     triggers = _triggers(workflow)
     for event in ("pull_request", "push"):
         assert set(triggers[event]["paths"]) == {
