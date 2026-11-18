@@ -42,7 +42,9 @@ async def test_spotify_playlist_access_journal_is_scoped_and_cursor_based(
         assert (await playlists.recent_touches())["playlists"] == []
         await playlists.tracks(first_id, provider.instance_id)
         first = await playlists.recent_touches()
-        assert first["playlists"] == [{"provider_instance": provider.instance_id, "item_id": first_id}]
+        assert first["playlists"] == [
+            {"provider_instance": provider.instance_id, "item_id": first_id}
+        ]
         cursor = first["cursor"]
         assert isinstance(cursor, str)
         assert (await playlists.recent_touches(cursor))["playlists"] == []
@@ -126,7 +128,9 @@ async def test_spotify_edit_is_observed_without_opening_playlist(
     monkeypatch.setattr(playlists, "_task_user", AsyncMock(return_value=OWNER))
     monkeypatch.setattr(playlists, "_get_editable_library_item", AsyncMock(return_value=playlist))
     monkeypatch.setattr(playlists, "_get_visible_library_item", AsyncMock(return_value=playlist))
-    monkeypatch.setattr(playlists, "_select_provider_id", MagicMock(return_value=(instance_id, playlist_id)))
+    monkeypatch.setattr(
+        playlists, "_select_provider_id", MagicMock(return_value=(instance_id, playlist_id))
+    )
     monkeypatch.setattr(playlists, "_request_metadata_refresh", AsyncMock())
     monkeypatch.setattr(
         "music_assistant.controllers.music.media.playlists.visible_music_sources",

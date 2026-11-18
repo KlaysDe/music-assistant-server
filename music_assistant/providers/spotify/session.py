@@ -274,40 +274,7 @@ class SpotifySession:
                 )
                 self._record_attempt(route, status, started, backoff_time)
                 if status == 429:
-                    # another session serves user actions and playback meanwhile
-                    moves_on = self._has_fallback and current_priority() is not RequestPriority.LOW
-                    cooldown = max(backoff_time, self.throttler.initial_backoff)
-                    # the gate closes before the body is read, so nothing follows this
-                    # request to a client that just asked to wait
-                    self.throttler.set_cooldown(cooldown)
-                    reason = await _rate_limit_reason(response)
-                    self._last_rate_limit_reason = reason
-                    self._last_rate_limit_at = utc()
-                    message = f"Spotify rate limited the {self.label}"
-                    if reason:
-                        message += f" ({reason})"
-                    quota_exceeded = reason == QUOTA_EXCEEDED
-                    warned = False
-                    if quota_exceeded:
-                        self._quota_answers += 1
-                        if warned := self._quota_answers == 1:
-                            self._warn_quota_exceeded(backoff_time)
-                    if moves_on or (self._has_fallback and quota_exceeded):
-                        # a used up quota does not come back within a retry either: the gate stays
-                        # closed for the time asked and the request gives up right away
-                        if quota_exceeded:
-                            # a block that goes on is asked about less and less
-                            doublings = min(self._quota_answers - 1, 10)
-                            cooldown = max(
-                                cooldown,
-                                min(self.throttler.initial_backoff * 2**doublings, MAX_BACKOFF),
-                            )
-                        self.throttler.set_cooldown(cooldown)
-                        if not warned:
-                            # the caller moves on to the other session, so nothing else logs this
-                            self.logger.info(message)
-                        raise RetriesExhausted(message, translation_key=RateLimited.translation_key)
-                    raise RateLimited(message, backoff_time=backoff_time)
+                    await self._handle_rate_limit(response, backoff_time)
                 self._quota_answers = 0
                 # handle token expired, raise ResourceTemporarilyUnavailable
                 # so it will be retried (and the token refreshed)
@@ -322,6 +289,43 @@ class SpotifySession:
             if not status:
                 self._record_attempt(route, status, started, 0)
             raise
+
+    async def _handle_rate_limit(self, response: aiohttp.ClientResponse, backoff_time: int) -> None:
+        """Close the cooldown gate and raise the appropriate rate-limit error."""
+        # another session serves user actions and playback meanwhile
+        moves_on = self._has_fallback and current_priority() is not RequestPriority.LOW
+        cooldown = max(backoff_time, self.throttler.initial_backoff)
+        # the gate closes before the body is read, so nothing follows this
+        # request to a client that just asked to wait
+        self.throttler.set_cooldown(cooldown)
+        reason = await _rate_limit_reason(response)
+        self._last_rate_limit_reason = reason
+        self._last_rate_limit_at = utc()
+        message = f"Spotify rate limited the {self.label}"
+        if reason:
+            message += f" ({reason})"
+        quota_exceeded = reason == QUOTA_EXCEEDED
+        warned = False
+        if quota_exceeded:
+            self._quota_answers += 1
+            if warned := self._quota_answers == 1:
+                self._warn_quota_exceeded(backoff_time)
+        if moves_on or (self._has_fallback and quota_exceeded):
+            # a used up quota does not come back within a retry either: the gate stays
+            # closed for the time asked and the request gives up right away
+            if quota_exceeded:
+                # a block that goes on is asked about less and less
+                doublings = min(self._quota_answers - 1, 10)
+                cooldown = max(
+                    cooldown,
+                    min(self.throttler.initial_backoff * 2**doublings, MAX_BACKOFF),
+                )
+            self.throttler.set_cooldown(cooldown)
+            if not warned:
+                # the caller moves on to the other session, so nothing else logs this
+                self.logger.info(message)
+            raise RetriesExhausted(message, translation_key=RateLimited.translation_key)
+        raise RateLimited(message, backoff_time=backoff_time)
 
     def _record_attempt(self, route: str, status: int, started: float, retry_after: int) -> None:
         """Log and count an attempt once, before any retry or fallback."""

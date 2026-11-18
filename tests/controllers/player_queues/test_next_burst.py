@@ -55,8 +55,8 @@ async def test_only_third_and_later_rapid_presses_wait() -> None:
     """Keep the first two responsive and schedule only the final target in a burst."""
     controller = _controller()
     timers = {}
-    controller.mass.call_later.side_effect = (
-        lambda *args, task_id, **kwargs: timers.update({task_id: (args, kwargs)})
+    controller.mass.call_later.side_effect = lambda *args, task_id, **kwargs: timers.update(
+        {task_id: (args, kwargs)}
     )
 
     assert await _press(controller, "main", 10.0) == 0

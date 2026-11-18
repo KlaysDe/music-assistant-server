@@ -675,11 +675,12 @@ class PlaylistController(MediaControllerBase[Playlist]):
         :param force_refresh: Request updated membership from the provider.
         :raises InvalidDataError: The request does not identify an exact Spotify playlist.
         """
-        if (
-            not _SPOTIFY_PLAYLIST_ID.fullmatch(item_id)
-            or not provider_instance_id_or_domain.startswith("spotify--")
-        ):
-            raise InvalidDataError("An exact Spotify provider instance and playlist ID are required")
+        if not _SPOTIFY_PLAYLIST_ID.fullmatch(
+            item_id
+        ) or not provider_instance_id_or_domain.startswith("spotify--"):
+            raise InvalidDataError(
+                "An exact Spotify provider instance and playlist ID are required"
+            )
         provider = self._playlist_provider(provider_instance_id_or_domain, True)
         if not isinstance(provider, MusicProvider) or provider.domain != "spotify":
             raise InvalidDataError("An exact Spotify provider instance is required")
@@ -687,13 +688,18 @@ class PlaylistController(MediaControllerBase[Playlist]):
         items = [
             media_item_to_playlist_item(track)
             async for track in self.iter_tracks(
-                item_id, provider.instance_id, force_refresh=force_refresh, strict_provider_instance=True
+                item_id,
+                provider.instance_id,
+                force_refresh=force_refresh,
+                strict_provider_instance=True,
             )
         ]
         image = playlist.image.path if playlist.image else None
         return {"playlist": playlist, "m3u_data": generate_m3u(playlist.name, items, image)}
 
-    async def recent_touches(self, cursor: str | None = None) -> dict[str, str | list[dict[str, str]]]:
+    async def recent_touches(
+        self, cursor: str | None = None
+    ) -> dict[str, str | list[dict[str, str]]]:
         """
         Return recent Spotify playlist accesses for the authenticated user.
 
@@ -714,9 +720,11 @@ class PlaylistController(MediaControllerBase[Playlist]):
             if entry.library_id is not None:
                 try:
                     await self._get_visible_library_item(entry.library_id)
-                except (MediaNotFoundError, InsufficientPermissions):
+                except MediaNotFoundError, InsufficientPermissions:
                     continue
-            playlists.append({"provider_instance": entry.provider_instance, "item_id": entry.item_id})
+            playlists.append(
+                {"provider_instance": entry.provider_instance, "item_id": entry.item_id}
+            )
         return {"cursor": next_cursor, "playlists": playlists}
 
     async def import_playlist(

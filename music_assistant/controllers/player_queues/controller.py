@@ -3274,7 +3274,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         )
 
     async def _move_to_index(
-        self, queue_id: str, index: int, starts_player: bool, *, next_pressed_at: float | None = None
+        self,
+        queue_id: str,
+        index: int,
+        starts_player: bool,
+        *,
+        next_pressed_at: float | None = None,
     ) -> None:
         """
         Play another item of a queue, for a step within it (next, previous).
