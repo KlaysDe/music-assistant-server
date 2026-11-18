@@ -418,7 +418,7 @@ async def test_quota_of_the_custom_client_id_moves_user_actions() -> None:
 
     await provider._get_data("me/tracks")
     assert _tokens_used(request) == ["dev", "global"]
-    provider.logger.warning.assert_called_once_with(  # type: ignore[attr-defined]
+    provider._dev_session.logger.warning.assert_called_once_with(  # type: ignore[attr-defined]
         "The %s has used up its Spotify quota, %s",
         "custom Client ID",
         "Spotify asks to wait 5 seconds",
@@ -486,7 +486,10 @@ async def test_a_limit_and_the_move_to_the_shared_client_are_both_logged() -> No
 
     await provider._get_data("me/tracks")
     assert _tokens_used(request) == ["dev", "global"]
-    logged = [call.args for call in provider.logger.info.call_args_list]  # type: ignore[attr-defined]
+    logged = [
+        call.args
+        for call in provider._dev_session.logger.info.call_args_list  # type: ignore[attr-defined]
+    ]
     assert ("Spotify rate limited the custom Client ID (SOME_REASON)",) in logged
     assert _fallback_logs(provider) == 1
 
