@@ -35,6 +35,7 @@ concurrency:
 jobs:
   resolve-release:
     name: Resolve release source and version
+    if: github.repository == 'music-assistant/server'
     runs-on: ubuntu-latest
     permissions:
       contents: read

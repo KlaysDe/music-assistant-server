@@ -37,6 +37,7 @@ concurrency:
 
 jobs:
   request:
+    if: github.repository == 'music-assistant/server'
     runs-on: ubuntu-latest
     steps:
       - name: 🔑 Create musicassistant-bot token

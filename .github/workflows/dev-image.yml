@@ -41,6 +41,7 @@ jobs:
   # digest found here. It needs no login, so a pull request from a fork gets through too.
   resolve:
     name: Resolve nightly image
+    if: github.repository == 'music-assistant/server'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
