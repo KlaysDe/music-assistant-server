@@ -1,0 +1,28 @@
+{
+  "type": "music",
+  "domain": "bbc_sounds",
+  "stage": "stable",
+  "name": "BBC Sounds",
+  "description": "Stream live BBC radio shows, podcast series and on-demand audio.",
+  "codeowners": [
+    "@kieranhogg"
+  ],
+  "documentation": "https://music-assistant.io/music-providers/bbc-sounds/",
+  "credits": [
+    "[auntie-sounds](https://github.com/kieranhogg/auntie-sounds)"
+  ],
+  "requirements": [
+    "auntie-sounds==3.1.0"
+  ],
+  "multi_instance": true,
+  "menu_actions": [
+    {
+      "id": "listen_from_start",
+      "label": "Listen from start",
+      "media_types": ["radio"],
+      "scope": "queues.control",
+      "icon": "mdi-restart",
+      "requires_player": true
+    }
+  ]
+}

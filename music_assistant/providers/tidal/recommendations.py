@@ -1,0 +1,199 @@
+"""Recommendation logic for Tidal."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from music_assistant_models.enums import MediaType, ProviderType
+from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.media_items import (
+    Album,
+    Artist,
+    BrowseFolder,
+    ItemMapping,
+    MediaItemType,
+    Playlist,
+    RecommendationFolder,
+    Track,
+    UniqueList,
+)
+
+from .constants import CACHE_CATEGORY_RECOMMENDATIONS, MAX_PAGE_MODULE_ITEMS, WEB_BASE_URL
+from .tidal_page_parser import TidalPageParser
+
+if TYPE_CHECKING:
+    from .provider import TidalProvider
+
+UNKNOWN_MODULE_TITLE = "Unknown"
+VIDEO_LIST_MODULE_TYPE = "VIDEO_LIST"
+
+
+class TidalRecommendationManager:
+    """Manages Tidal recommendations."""
+
+    def __init__(self, provider: TidalProvider):
+        """Initialize recommendation manager."""
+        self.provider = provider
+        self.api = provider.api
+        self.auth = provider.auth
+        self.logger = provider.logger
+        self.mass = provider.mass
+        self.page_cache_ttl = 3 * 3600
+
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Get this provider's recommendations organized into folders."""
+        results: list[RecommendationFolder] = []
+        pages = [
+            "pages/home",
+            "pages/for_you",
+            "pages/hi_res",
+            "pages/explore_new_music",
+            "pages/explore_top_music",
+        ]
+        combined_modules: dict[str, list[Playlist | Album | Track | Artist]] = {}
+        module_content_types: dict[str, MediaType] = {}
+        module_page_names: dict[str, str] = {}
+
+        all_tidal_configs = await self.mass.config.get_provider_configs(ProviderType.MUSIC)
+        tidal_configs = [
+            config for config in all_tidal_configs if config.domain == self.provider.domain
+        ]
+        sorted_instances = sorted(tidal_configs, key=lambda x: x.instance_id)
+        show_user_identifier = len(sorted_instances) > 1
+
+        for page_path in pages:
+            parser = await self.get_page_content(page_path)
+            page_name = page_path.split("/")[-1].replace("_", " ").title()
+
+            for module_info in parser.modules:
+                if not _is_music_module(module_info):
+                    continue
+                title = module_info["title"]
+
+                items, content_type = parser.get_module_items(module_info)
+                if not items:
+                    continue
+
+                key = f"{self.auth.user_id}_{title}"
+                if key not in combined_modules:
+                    combined_modules[key] = []
+                    module_content_types[key] = content_type
+                    module_page_names[key] = page_name
+
+                combined_modules[key].extend(items)
+
+        for key, items in combined_modules.items():
+            user_id_prefix = f"{self.auth.user_id}_"
+            title = key.removeprefix(user_id_prefix)
+
+            unique_items = UniqueList(items)
+            item_id = "".join(c for c in key.lower().replace(" ", "_") if c.isalnum() or c == "_")
+            content_type = module_content_types.get(key, MediaType.PLAYLIST)
+            page_name = module_page_names.get(key, "Tidal")
+
+            folder_name = title
+            if show_user_identifier:
+                raw_user_name = (
+                    self.auth.user.profile_name
+                    or self.auth.user.user_name
+                    or str(self.auth.user_id)
+                )
+                user_name = raw_user_name.split("@", 1)[0]
+                folder_name = f"{title} ({user_name})"
+
+            results.append(
+                RecommendationFolder(
+                    item_id=item_id,
+                    name=folder_name,
+                    provider=self.provider.instance_id,
+                    items=UniqueList[MediaItemType | ItemMapping | BrowseFolder](unique_items),
+                    subtitle=f"From {page_name} • {len(unique_items)} items",
+                    translation_key=item_id,
+                    icon="mdi-playlist-music"
+                    if content_type == MediaType.PLAYLIST
+                    else "mdi-album",
+                )
+            )
+
+        return results
+
+    async def get_page_content(self, page_path: str = "pages/home") -> TidalPageParser:
+        """Get a lazy page parser for a Tidal page."""
+        if cached := await TidalPageParser.from_cache(self.provider, page_path):
+            return cached
+
+        # Let fetch/parse errors propagate: swallowing them here would make
+        # recommendations() succeed with an empty result, which the caching
+        # wrapper would then store for the full TTL.
+        locale = self.mass.metadata.locale.replace("_", "-")
+        params = {
+            "locale": locale,
+            "deviceType": "BROWSER",
+            "countryCode": self.auth.country_code or "US",
+        }
+        data = await self.api.get(page_path, base_url=WEB_BASE_URL, params=params) or {}
+        for row in data.get("rows", []):
+            for module in row.get("modules", []):
+                if _is_music_module(module):
+                    await self._extend_truncated_module(module, params)
+
+        parser = TidalPageParser(self.provider)
+        parser.parse_page_structure(data, page_path)
+
+        await self.mass.cache.set(
+            key=page_path,
+            data=parser.to_cache(),
+            provider=self.provider.instance_id,
+            category=CACHE_CATEGORY_RECOMMENDATIONS,
+            expiration=self.page_cache_ttl,
+        )
+        return parser
+
+    async def _extend_truncated_module(
+        self, module: dict[str, Any], params: dict[str, str]
+    ) -> None:
+        """
+        Fetch the items a page module did not embed, up to MAX_PAGE_MODULE_ITEMS.
+
+        :param module: Raw page module, its pagedList is extended in place.
+        :param params: Locale/device params shared with the page request.
+        """
+        paged_list = module.get("pagedList")
+        if not isinstance(paged_list, dict):
+            return
+        data_api_path = paged_list.get("dataApiPath")
+        items: list[dict[str, Any]] | None = paged_list.get("items")
+        if not data_api_path or items is None:
+            return
+        target = min(paged_list.get("totalNumberOfItems") or 0, MAX_PAGE_MODULE_ITEMS)
+        try:
+            while len(items) < target:
+                response = await self.api.get(
+                    data_api_path,
+                    base_url=WEB_BASE_URL,
+                    params={**params, "offset": len(items), "limit": target - len(items)},
+                )
+                new_items = (response or {}).get("items") or []
+                if not new_items:
+                    break
+                items.extend(new_items[: target - len(items)])
+        # The error text carries the request URL, sessionId included, so it is not logged
+        except MediaNotFoundError:
+            self.logger.warning(
+                "Extra items for Tidal module %s not found, keeping the embedded ones",
+                module.get("title"),
+            )
+
+
+def _is_music_module(module: dict[str, Any]) -> bool:
+    """Return False for untitled and video modules, which are never shown."""
+    title = module.get("title", UNKNOWN_MODULE_TITLE)
+    # Drop video content: VIDEO_LIST modules outright, plus any module whose
+    # title mentions video (e.g. "Video Playlists", which is a PLAYLIST_LIST
+    # the old "Videos"-substring check missed).
+    return (
+        bool(title)
+        and title != UNKNOWN_MODULE_TITLE
+        and module.get("type") != VIDEO_LIST_MODULE_TYPE
+        and "video" not in title.lower()
+    )

@@ -1,0 +1,1162 @@
+"""
+Player-state reconciliation for the Player Queues controller.
+
+Translates a player's reported state into the queue's state: tracks the current index/elapsed time,
+detects track changes and end-of-queue, drives the playback-progress reports (and the user-initiated
+/ album-credit play-counting), and computes the flow-mode stream index. Owns no per-queue state of
+its own; it reads and mutates the controller's `PlayerQueueData` records via its owning controller.
+"""
+
+# ruff: noqa: PLR0915  -- the player-state reconciliation methods are large state machines by nature
+
+from __future__ import annotations
+
+import asyncio
+import time
+from contextlib import suppress
+from typing import TYPE_CHECKING, cast
+
+from music_assistant_models.enums import (
+    EventType,
+    MediaType,
+    PlaybackState,
+    ProviderFeature,
+    ProviderType,
+)
+from music_assistant_models.errors import (
+    MusicAssistantError,
+    ResourceBusyError,
+)
+from music_assistant_models.media_items import (
+    Album,
+    Artist,
+    Audiobook,
+    ItemMapping,
+    MediaItemType,
+    PodcastEpisode,
+)
+from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
+
+from music_assistant.constants import (
+    ATTR_ANNOUNCEMENT_IN_PROGRESS,
+    PLAYBACK_REPORT_INTERVAL_SECONDS,
+    VERBOSE_LOG_LEVEL,
+)
+from music_assistant.controllers.music.favorites import without_disliked_tracks
+from music_assistant.controllers.player_queues.base import _PlayerQueuesBase
+from music_assistant.controllers.player_queues.constants import (
+    PLAYED_TO_END_MARGIN,
+    SLEEP_TIMER_NATURAL_END_MARGIN,
+)
+from music_assistant.controllers.player_queues.helpers import (
+    CompareState,
+    build_queue_item,
+    find_dynamic_source,
+    get_current_playback_speed,
+    origin_for,
+    played_from_album,
+)
+from music_assistant.controllers.webserver.helpers.auth_middleware import (
+    set_current_user,
+    set_impersonated_user,
+)
+from music_assistant.helpers.compare import compare_item_ids
+from music_assistant.helpers.provider_access import exact_provider
+from music_assistant.helpers.util import get_changed_keys, percentage
+from music_assistant.models.music_provider import MusicProvider
+from music_assistant.models.player import Player
+from music_assistant.models.plugin import PluginProvider
+
+if TYPE_CHECKING:
+    from music_assistant_models.player_queue import PlayerQueue
+    from music_assistant_models.queue_item import QueueItem
+
+    from music_assistant.controllers.player_queues.state import PlayerQueueData
+
+
+# media types that never put a queue in the ended state: a live source has no natural end,
+# so it going idle means the source stopped and not that the queue ran out (marking it
+# ended would strand a later resume)
+UNENDABLE_MEDIA_TYPES = (MediaType.RADIO, MediaType.AUDIO_SOURCE)
+
+
+class PlaybackTrackerMixin(_PlayerQueuesBase):
+    """Reconcile a queue's state against its player and drive playback-progress reporting."""
+
+    def is_playing_queue(self, queue_id: str, player: Player) -> bool:
+        """
+        Return whether the player renders the given queue, as far as the server can tell.
+
+        True when the queue has a stream session and the media the player reports names
+        it; a player that reports no usable media counts as rendering the queue when the
+        queue is playing.
+
+        :param queue_id: The queue to check against.
+        :param player: The player whose reported media is checked.
+        """
+        queue_data = self._queue_data.get(queue_id)
+        if queue_data is None or queue_data.session_id is None:
+            return False
+        if (reported := self._reported_queue_id(player)) is not None:
+            # the player's own report is fresher than the queue state, which follows the
+            # player with a delay and can still read idle on the first playing update
+            return reported == queue_id
+        return queue_data.queue.state == PlaybackState.PLAYING
+
+    def _update_current_index_from_player(self, queue: PlayerQueue, player: Player) -> bool:
+        """
+        Update the current item/index/elapsed time on the queue from the player state.
+
+        Returns True if the update was successful, False if the caller should return early.
+        """
+        queue_id = queue.queue_id
+        if queue.active and queue.state in (
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        ):
+            # NOTE: If the queue is not playing (yet) we will not update the current index
+            # to ensure we keep the previously known current index
+            if queue.flow_mode:
+                # flow mode active, the player is playing one long stream
+                # so we need to calculate the current index and elapsed time
+                # (already returned in media-time)
+                current_index, elapsed_time = self._get_flow_queue_stream_index(queue, player)
+            elif item_id := self._parse_player_current_item_id(queue_id, player):
+                # normal mode, the player itself will report the current item
+                elapsed_time = player.corrected_elapsed_time or 0
+                current_index = self.index_by_id(queue_id, item_id)
+            else:
+                # this may happen if the player is still transitioning between tracks
+                # we ignore this for now and keep the current index as is
+                return False
+
+            # get current/next item based on current index
+            queue.current_index = current_index
+            queue.current_item = current_item = self.get_item(queue_id, current_index)
+            queue.next_item = (
+                self.get_next_item(queue_id, current_index)
+                if current_item and current_index is not None
+                else None
+            )
+
+            # convert player's stream-time to media-time and add seek offset (non-flow only;
+            # flow mode already returns media-time from _get_flow_queue_stream_index above)
+            speed = get_current_playback_speed(queue)
+            if not queue.flow_mode:
+                elapsed_time *= speed
+                if (
+                    current_item
+                    and current_item.streamdetails
+                    and current_item.streamdetails.seek_position
+                ):
+                    elapsed_time += current_item.streamdetails.seek_position
+            queue.elapsed_time = elapsed_time
+            queue.elapsed_time_last_updated = time.time()
+            queue.playback_speed = speed
+
+        elif not queue.current_item and queue.current_index is not None:
+            current_index = queue.current_index
+            queue.current_item = current_item = self.get_item(queue_id, current_index)
+            queue.next_item = (
+                self.get_next_item(queue_id, current_index)
+                if current_item and current_index is not None
+                else None
+            )
+        return True
+
+    def _update_queue_from_player(
+        self,
+        player: Player,
+    ) -> None:
+        """Update the Queue when the player state changed."""
+        queue_id = player.player_id
+        queue_data = self._queue_data[queue_id]
+        queue = queue_data.queue
+
+        # basic properties
+        queue.display_name = player.name
+        queue.available = player.available
+        queue.smart_fades_active = self.mass.streams.is_smart_fades_active(queue)
+        queue.smart_shuffle_active = self.is_smart_shuffle_active(queue)
+        queue.items = len(self._queue_data[queue_id].items)
+
+        queue.state = (
+            player.playback_state or PlaybackState.IDLE if queue.active else PlaybackState.IDLE
+        )
+        # update current item/index from player report
+        if not self._update_current_index_from_player(queue, player):
+            return
+
+        output_player_ids = self._get_output_player_ids(player)
+
+        # basic throttle: do not send state changed events if queue did not actually change
+        prev_state: CompareState = self._queue_data[queue_id].prev_state or CompareState(
+            queue_id=queue_id,
+            state=PlaybackState.IDLE,
+            current_item_id=None,
+            next_item_id=None,
+            current_item=None,
+            elapsed_time=0,
+            last_playing_elapsed_time=0,
+            stream_title=None,
+            codec_type=None,
+            output_player_ids=None,
+        )
+        # update last_playing_elapsed_time only when the player is actively playing
+        # use corrected_elapsed_time which accounts for time since last update
+        # this preserves the last known elapsed time when transitioning to idle/paused
+        prev_playing_elapsed = prev_state["last_playing_elapsed_time"]
+        prev_item_id = prev_state["current_item_id"]
+        current_item_id = queue.current_item.queue_item_id if queue.current_item else None
+        if queue.state == PlaybackState.PLAYING:
+            current_elapsed = int(queue.corrected_elapsed_time)
+            if current_item_id != prev_item_id:
+                # new track started, reset the elapsed time tracker
+                last_playing_elapsed_time = current_elapsed
+            else:
+                # same track, use the max of current and previous to handle timing issues
+                last_playing_elapsed_time = max(current_elapsed, prev_playing_elapsed)
+        elif current_item_id != prev_item_id:
+            # the item changed while not playing (e.g. a position correction into another
+            # track): the previous item's position is no resume position for this one
+            last_playing_elapsed_time = int(queue.elapsed_time)
+        else:
+            last_playing_elapsed_time = prev_playing_elapsed
+        new_state = CompareState(
+            queue_id=queue_id,
+            state=queue.state,
+            current_item_id=queue.current_item.queue_item_id if queue.current_item else None,
+            next_item_id=queue.next_item.queue_item_id if queue.next_item else None,
+            current_item=queue.current_item,
+            elapsed_time=int(queue.elapsed_time),
+            last_playing_elapsed_time=last_playing_elapsed_time,
+            stream_title=(
+                queue.current_item.streamdetails.stream_title
+                if queue.current_item and queue.current_item.streamdetails
+                else None
+            ),
+            codec_type=(
+                queue.current_item.streamdetails.audio_format.codec_type
+                if queue.current_item and queue.current_item.streamdetails
+                else None
+            ),
+            output_player_ids=sorted(output_player_ids),
+        )
+        changed_keys = get_changed_keys(dict(prev_state), dict(new_state))
+        with suppress(KeyError):
+            changed_keys.remove("next_item_id")
+        with suppress(KeyError):
+            changed_keys.remove("last_playing_elapsed_time")
+
+        # store the new state
+        if queue.active:
+            self._queue_data[queue_id].prev_state = new_state
+        else:
+            self._queue_data[queue_id].prev_state = None
+        if queue.state != PlaybackState.IDLE:
+            queue_data.played_session_id = queue_data.started_session_id
+
+        # return early if nothing changed
+        if len(changed_keys) == 0:
+            return
+
+        # signal update and store state
+        send_update = True
+        if changed_keys == {"elapsed_time"}:
+            # only elapsed time changed, do not send full queue update
+            send_update = False
+            prev_time = prev_state.get("elapsed_time") or 0
+            cur_time = new_state.get("elapsed_time") or 0
+            if abs(cur_time - prev_time) > 2:
+                # send dedicated event for time updates when seeking
+                self.mass.signal_event(
+                    EventType.QUEUE_TIME_UPDATED,
+                    object_id=queue_id,
+                    data=queue.elapsed_time,
+                )
+                # also signal update to the player itself so it can update its current_media
+                self.mass.players.trigger_player_update(queue_id)
+
+        processing_update_sent = False
+        if "output_player_ids" in changed_keys:
+            processing_update_sent = self.mass.streams.audio_processing.retain_outputs(
+                queue_id,
+                output_player_ids,
+            )
+        if send_update and not processing_update_sent:
+            self.signal_update(queue_id)
+
+        # handle updating stream_metadata if needed
+        if (
+            queue.current_item
+            and (streamdetails := queue.current_item.streamdetails)
+            and streamdetails.stream_metadata_update_callback
+            and (
+                streamdetails.stream_metadata_last_updated is None
+                or (
+                    time.time() - streamdetails.stream_metadata_last_updated
+                    >= streamdetails.stream_metadata_update_interval
+                )
+            )
+        ):
+            streamdetails.stream_metadata_last_updated = time.time()
+            self.mass.create_task(
+                streamdetails.stream_metadata_update_callback(
+                    streamdetails, int(queue.corrected_elapsed_time)
+                )
+            )
+
+        # handle sending a playback progress report
+        # we do this every 30 seconds or when the state changes
+        if (
+            changed_keys.intersection({"state", "current_item_id"})
+            or int(queue.elapsed_time) % PLAYBACK_REPORT_INTERVAL_SECONDS == 0
+        ):
+            self._handle_playback_progress_report(queue, prev_state, new_state)
+            if prev_state["current_item_id"] not in (None, new_state["current_item_id"]):
+                # the report above was the previous item's, the streaming provider also
+                # learns at once that the next one started
+                self._handle_playback_progress_report(
+                    queue, new_state, new_state, record_play=False
+                )
+
+        # stop at the point a sleep timer waits for, before the end of queue check below reads
+        # a stopped queue as one that ran out of items
+        self._handle_sleep_timer(queue, prev_state, new_state)
+
+        if "state" in changed_keys and queue.state == PlaybackState.PLAYING:
+            queue_data.halted_by_command = False
+        # check if we need to clear the queue if we reached the end
+        if "state" in changed_keys and queue.state == PlaybackState.IDLE:
+            self._handle_end_of_queue(queue, prev_state, new_state)
+
+        # refill the queue (dynamic mode or autoplay) when running low on tracks, and keep the
+        # Smart Fades ordering ahead of playback
+        if "current_item_id" in changed_keys:
+            running_low = (
+                queue.current_index is not None and (queue.items - queue.current_index) < 5
+            )
+            if queue.is_dynamic and running_low:
+                # a dynamic queue tops up its bounded managed pool from its (dynamic + finite) sources
+                task_id = f"fill_dynamic_tracks_{queue_id}"
+                self.mass.call_later(5, self._fill_dynamic_tracks, queue_id, task_id=task_id)
+            elif queue.autoplay_enabled and running_low:
+                # autoplay appends whatever continues the queue's last item (more music, the
+                # next podcast episode/audiobook, or nothing at all)
+                task_id = f"fill_autoplay_tracks_{queue_id}"
+                self.mass.call_later(5, self._fill_autoplay_tracks, queue_id, task_id=task_id)
+            if queue.shuffle_enabled:
+                self._smart_shuffle.schedule_next_batch(queue)
+
+    def _get_output_player_ids(self, player: Player) -> set[str]:
+        """Return destination player IDs represented in the processing chain."""
+        output_player_ids = {player.player_id}
+        for member_id in player.group_members:
+            member = self.mass.players.get_player_or_protocol_player(member_id)
+            output_player_ids.add(member.player_id if member else member_id)
+        return output_player_ids
+
+    def _get_flow_queue_stream_index(
+        self, queue: PlayerQueue, player: Player
+    ) -> tuple[int | None, float]:
+        """
+        Calculate current queue index and current track elapsed time when flow mode is active.
+
+        The player reports cumulative stream-time (post-atempo). The returned
+        track elapsed time is in media-time, scaled by the current item's
+        playback_speed when we hit the active entry.
+        """
+        queue_data = self._queue_data[queue.queue_id]
+        elapsed_time_queue_total = player.corrected_elapsed_time or 0
+        if queue.current_index is None and not queue_data.flow_mode_stream_log:
+            return queue.current_index, queue.elapsed_time
+
+        # For each track that has been streamed/buffered to the player,
+        # a playlog entry will be created with the queue item id
+        # and the amount of seconds streamed. We traverse the playlog to figure
+        # out where we are in the queue, accounting for actual streamed
+        # seconds (and not duration) and skipped seconds. If a track has been repeated,
+        # it will simply be in the playlog multiple times.
+        played_time = 0.0
+        queue_index: int | None = queue.current_index or 0
+        track_time = 0.0
+        flow_log = queue_data.flow_mode_stream_log
+        for log_index, play_log_entry in enumerate(flow_log):
+            # seconds_streamed is bytes-derived stream-time, so the boundary check
+            # doesn't need a speed factor. Normally only the still-streaming tail entry
+            # has seconds_streamed=None (we'll break inside it before the sentinel
+            # matters); an abandoned probe entry is the exception, handled below.
+            if play_log_entry.seconds_streamed is not None:
+                # NOTE: 'seconds_streamed' can be 0 if there was a stream error
+                entry_stream_duration = play_log_entry.seconds_streamed
+            elif log_index < len(flow_log) - 1:
+                # Some players open the same flow URL several times while probing the
+                # stream. A probe can leave an unfinished entry behind before the
+                # connection that actually plays the audio appends the next entry.
+                # Recover the completed stream duration from the shared QueueItem;
+                # treating this non-tail entry as the active sentinel would pin the
+                # queue to the previous track and let elapsed time overflow its duration.
+                stale_queue_item = self.get_item(queue.queue_id, play_log_entry.queue_item_id)
+                if (
+                    stale_queue_item
+                    and stale_queue_item.streamdetails
+                    and stale_queue_item.streamdetails.seconds_streamed is not None
+                ):
+                    entry_stream_duration = stale_queue_item.streamdetails.seconds_streamed
+                else:
+                    entry_stream_duration = 0
+            else:
+                entry_stream_duration = 3600 * 24 * 7
+            if elapsed_time_queue_total > (entry_stream_duration + played_time):
+                # total elapsed time is more than (streamed) track duration
+                # this track has been fully played, move on.
+                played_time += entry_stream_duration
+            else:
+                # no more seconds left to divide, this is our track
+                # account for any seeking by adding the skipped/seeked seconds
+                queue_index = self.index_by_id(queue.queue_id, play_log_entry.queue_item_id)
+                queue_item = self.get_item(queue.queue_id, queue_index)
+                if queue_item and queue_item.streamdetails:
+                    track_sec_skipped = queue_item.streamdetails.seek_position
+                else:
+                    track_sec_skipped = 0
+                # Each repeat shares a QueueItem, but buffered audio from the previous
+                # playback still needs the offset captured before the repeat was loaded.
+                if play_log_entry.seek_position is not None:
+                    track_sec_skipped = play_log_entry.seek_position
+                # stream-time within this entry, scaled to media-time using the
+                # speed of the entry we broke on (queue.current_item may still be
+                # the previous entry during a transition)
+                entry_speed = (
+                    float(queue_item.extra_attributes.get("playback_speed") or 1.0)
+                    if queue_item
+                    else 1.0
+                )
+                stream_pos_in_item = elapsed_time_queue_total - played_time
+                track_time = track_sec_skipped + stream_pos_in_item * entry_speed
+                break
+        if not self._position_is_reliable(player):
+            # if the player is not playing, we can't be sure that the elapsed time is correct
+            # so we just return the queue index and the elapsed time
+            return queue.current_index, queue.elapsed_time
+        return queue_index, track_time
+
+    @staticmethod
+    def _position_is_reliable(player: Player) -> bool:
+        """Return if the player's elapsed time is its real position."""
+        playback_state = player.playback_state
+        if playback_state == PlaybackState.PLAYING:
+            return True
+        if playback_state != PlaybackState.PAUSED:
+            return False
+        protocol = player.resolve_output_protocol()
+        return protocol is not None and protocol.paused_position_reliable
+
+    def _parse_player_current_item_id(self, queue_id: str, player: Player) -> str | None:
+        """Parse QueueItem ID from Player's current url."""
+        protocol_player = player.resolve_output_protocol()
+        if protocol_player is None or not protocol_player.current_media:
+            # YES, we use the current_media of the protocol on purpose here because we need
+            # the raw metadata
+            return None
+        # prefer queue_id and queue_item_id within the current media
+        if (
+            protocol_player.current_media.source_id == queue_id
+            and protocol_player.current_media.queue_item_id
+        ):
+            current_item_id = protocol_player.current_media.queue_item_id
+            # After a queue replace, the player may still report the removed item.
+            # Ignore it to preserve the new queue position.
+            if self.get_item(queue_id, current_item_id):
+                return current_item_id
+            return None
+        # special case for sonos players
+        if protocol_player.current_media.uri and protocol_player.current_media.uri.startswith(
+            f"mass:{queue_id}"
+        ):
+            current_item_id = (
+                protocol_player.current_media.queue_item_id
+                or protocol_player.current_media.uri.split(":")[-1]
+            )
+            if self.get_item(queue_id, current_item_id):
+                return current_item_id
+            return None
+        # try to extract the item id from a mass stream url
+        # URL format: {base_url}/{mode}/{session_id}/{queue_id}/{queue_item_id}/{player_id}.{fmt}
+        base_url = self.mass.streams.base_url
+        if (
+            protocol_player.current_media.uri
+            and base_url
+            and protocol_player.current_media.uri.startswith(base_url)
+        ):
+            path_parts = protocol_player.current_media.uri[len(base_url) :].strip("/").split("/")
+            # the path holds mode, session_id, queue_id, queue_item_id and player_id.fmt
+            if len(path_parts) >= 5:
+                current_item_id = path_parts[3]
+                if self.get_item(queue_id, current_item_id):
+                    return current_item_id
+
+        return None
+
+    def _reported_queue_id(self, player: Player) -> str | None:
+        """Return the known queue the player's reported media names, if it names one."""
+        protocol_player = player.resolve_output_protocol()
+        if protocol_player is None or not (current_media := protocol_player.current_media):
+            return None
+        candidates: list[str | None] = [current_media.source_id]
+        uri = current_media.uri or ""
+        if uri.startswith("mass:"):
+            # the sonos container id: mass:{queue_id}[:{queue_item_id}]
+            candidates.append(uri.split(":")[1])
+        base_url = self.mass.streams.base_url
+        if base_url and uri.startswith(base_url):
+            path_parts = uri[len(base_url) :].strip("/").split("/")
+            # the path holds mode, session_id, queue_id, queue_item_id and player_id.fmt
+            if len(path_parts) >= 5:
+                candidates.append(path_parts[2])
+        # only a queue this server has can be evidence; anything else is unknown media
+        return next((x for x in candidates if x and x in self._queue_data), None)
+
+    def _handle_end_of_queue(  # noqa: C901
+        self, queue: PlayerQueue, prev_state: CompareState, new_state: CompareState
+    ) -> None:
+        """Check if the queue should be cleared after the current item."""
+        queue_data = self._queue_data[queue.queue_id]
+        # check if queue state changed to stopped (from playing/paused to idle)
+        if not (
+            prev_state["state"] in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+            and new_state["state"] == PlaybackState.IDLE
+        ):
+            return
+        sleep_timer_stopped_target = queue_data.sleep_timer_stopped_target
+        queue_data.sleep_timer_stopped_target = None
+        if queue_data.halted_by_command and sleep_timer_stopped_target is None:
+            # a pause or a stop is not the end of the queue; the stop of a sleep timer is handled
+            # below, as it ends playback at the point the timer waited for
+            return
+        # check if no more items in the queue (next_item should be None at end of queue)
+        if queue.next_item is not None:
+            if (
+                sleep_timer_stopped_target is not None
+                and (stopped_item := queue.current_item) is not None
+                and stopped_item.queue_item_id == sleep_timer_stopped_target.queue_item_id
+                and sleep_timer_stopped_target.stop_position >= (stopped_item.duration or 0)
+                and (next_index := self.index_by_id(queue.queue_id, queue.next_item.queue_item_id))
+                is not None
+            ):
+                # the sleep timer stopped at the end of the item: playing on starts the next one
+                queue.current_index = next_index
+                queue.current_item = queue.next_item
+                queue.next_item = self.get_next_item(queue.queue_id, next_index)
+                queue.elapsed_time = 0
+                queue.elapsed_time_last_updated = time.time()
+                queue.resume_pos = 0
+            return
+        # check if we had a previous item playing
+        if prev_state["current_item_id"] is None:
+            return
+        if prev_state["current_item_id"] not in queue_data.served_item_ids:
+            # the player stopped on an item it never received audio for (one from its own cached
+            # copy of the queue that the stream server then refused): it did not reach the end of
+            # the queue, so the queue must stay where it is and remain resumable
+            return
+        if (
+            player := self.mass.players.get_player(queue.queue_id)
+        ) and player.offline_by_power_control:
+            # it was switched off, so it did not reach the end of the queue either
+            return
+
+        # retrieve prev_item here so it's available in the _settle_or_resume_delayed closure
+        # regardless of which code path (flow mode or non-flow mode) creates the task
+        prev_item = prev_state["current_item"]
+
+        if prev_item is not None and prev_item.media_type in UNENDABLE_MEDIA_TYPES:
+            return
+
+        def _switched_off() -> bool:
+            # a player switched off meanwhile is not powered on again to continue playback
+            player = self.mass.players.get_player(queue.queue_id)
+            return player is not None and player.offline_by_power_control
+
+        # the check belongs to the playback that went idle here, which is not the session that
+        # started last when a play started before its player was seen idle
+        session_id = queue_data.played_session_id
+
+        async def _still_at_its_end() -> bool:
+            # a command that holds the player (a play action that starts the queue, a stop) is
+            # done first; a player that stays busy keeps its queue as it is
+            try:
+                async with self.mass.players.get_group_and_player_lock(queue.queue_id):
+                    pass
+            except ResourceBusyError:
+                return False
+            if self._queue_data.get(queue.queue_id) is not queue_data:
+                # the queue was removed or re-registered
+                return False
+            if queue.state != PlaybackState.IDLE:
+                return False
+            if queue_data.started_session_id != session_id:
+                # a play started since, which has the queue also while its player does not
+                # report that it plays yet, and when a stop ended it before that
+                return False
+            return not _switched_off()
+
+        async def _settle_or_resume_delayed() -> None:
+            if sleep_timer_stopped_target is not None:
+                # the sleep timer ended playback here: nothing resumes or refills the queue
+                self._finish_queue(queue, prev_item)
+                return
+            for _ in range(5):
+                await asyncio.sleep(1)
+                if not await _still_at_its_end():
+                    return
+                if queue.next_item is not None:
+                    return
+                # check the actual queue items list for newly added items
+                # queue.next_item may be stale as it's only updated during PLAYING/PAUSED
+                if queue.current_index is not None and (
+                    next_item := self.get_next_item(queue.queue_id, queue.current_index)
+                ):
+                    next_index = self.index_by_id(queue.queue_id, next_item.queue_item_id)
+                    if next_index is not None:
+                        self.logger.info(
+                            "Items added to queue while idle, resuming playback for %s",
+                            queue.display_name,
+                        )
+                        with self.mass.players.without_member_power_on():
+                            await self.play_index(queue.queue_id, next_index)
+                    return
+            # If the queue was started from a dynamic source, fetch fresh tracks and continue.
+            dynamic_source = find_dynamic_source(queue_data)
+            if dynamic_source is not None:
+                try:
+                    # Restore the queue owner's user context so provider filters and
+                    # per-user logic (e.g. smart playlist dedup) are respected during
+                    # this background refill, mirroring _fill_dynamic_tracks.
+                    playback_user = (
+                        await self.mass.webserver.auth.get_user(queue_data.userid)
+                        if queue_data.userid
+                        else None
+                    )
+                    set_current_user(playback_user)
+                    # the refill runs as the owner, not as a user the scheduling call impersonated
+                    set_impersonated_user(None)
+                    dynamic_tracks = await self._media_resolver.get_dynamic_source_tracks(
+                        dynamic_source
+                    )
+                    dynamic_tracks = await without_disliked_tracks(
+                        self.mass, queue_data.userid, dynamic_tracks
+                    )
+                    if not await _still_at_its_end():
+                        return
+                    if dynamic_tracks:
+                        queue_items = [
+                            build_queue_item(
+                                queue.queue_id, x, origin=origin_for(dynamic_source, x)
+                            )
+                            for x in dynamic_tracks
+                            if x.available
+                        ]
+                        if queue_items:
+                            cur_index = queue.current_index or 0
+                            await self.load(
+                                queue.queue_id,
+                                queue_items,
+                                insert_at_index=cur_index + 1,
+                                keep_remaining=False,
+                                keep_played=True,
+                                shuffle=False,
+                            )
+                            if queue.current_index is not None and (
+                                next_item := self.get_next_item(queue.queue_id, queue.current_index)
+                            ):
+                                next_index = self.index_by_id(
+                                    queue.queue_id, next_item.queue_item_id
+                                )
+                                if next_index is not None:
+                                    with self.mass.players.without_member_power_on():
+                                        await self.play_index(queue.queue_id, next_index)
+                                    return
+                except MusicAssistantError as err:
+                    self.logger.warning(
+                        "Failed to refresh dynamic source %s for queue %s: %s",
+                        getattr(dynamic_source, "name", repr(dynamic_source)),
+                        queue.display_name,
+                        err,
+                    )
+            if await _still_at_its_end():
+                self._finish_queue(queue, prev_item)
+
+        # all checks passed, we stopped playback at the last (or single) track of the queue
+        # now determine if the item was fully played before settling/resuming
+
+        # For flow mode, check if the last track was fully streamed using the stream log
+        # This is more reliable than elapsed_time which can be reset/incorrect
+        if queue.flow_mode and queue_data.flow_mode_stream_log:
+            last_log_entry = queue_data.flow_mode_stream_log[-1]
+            if last_log_entry.seconds_streamed is not None:
+                # Guard: if a next item (e.g. a radio that caused the flow stream to break
+                # out early) is already queued, the queue_buffer_completed path
+                # (_resume_on_idle) is responsible for starting it. Creating
+                # _settle_or_resume_delayed here would race with that restart and could
+                # incorrectly settle the queue or trigger a double play_index call.
+                if queue.current_index is not None and self.get_next_item(
+                    queue.queue_id, queue.current_index
+                ):
+                    return
+                self.mass.create_task(
+                    _settle_or_resume_delayed(),
+                    task_name=f"settle_or_resume_{queue.queue_id}",
+                    task_id=f"settle_or_resume_{queue.queue_id}",
+                    abort_existing=True,
+                )
+            return
+
+        # For non-flow mode, use prev_state values since queue state may have been updated/reset
+        if prev_item and (streamdetails := prev_item.streamdetails):
+            duration = streamdetails.duration or prev_item.duration or 24 * 3600
+        elif prev_item:
+            duration = prev_item.duration or 24 * 3600
+        else:
+            # No current item means player has already cleared it, safe to clear queue
+            self.mass.create_task(
+                _settle_or_resume_delayed(),
+                task_name=f"settle_or_resume_{queue.queue_id}",
+                task_id=f"settle_or_resume_{queue.queue_id}",
+                abort_existing=True,
+            )
+            return
+
+        # use last_playing_elapsed_time which preserves the elapsed time from when the player
+        # was still playing (before transitioning to idle where elapsed_time may be reset to 0)
+        seconds_played = int(prev_state["last_playing_elapsed_time"])
+        # debounce this a bit to make sure we're not clearing the queue by accident
+        # only clear if the last track was played to near completion (within 5 seconds of end)
+        if seconds_played >= (duration or 3600) - 5:
+            self.mass.create_task(
+                _settle_or_resume_delayed(),
+                task_name=f"settle_or_resume_{queue.queue_id}",
+                task_id=f"settle_or_resume_{queue.queue_id}",
+                abort_existing=True,
+            )
+
+    def _finish_queue(self, queue: PlayerQueue, prev_item: QueueItem | None) -> None:
+        """
+        Settle a queue that has nothing left to play, based on the item it ended on.
+
+        :param queue: The queue that ran out of items.
+        :param prev_item: The item the queue was playing when it went idle, if it is still known.
+        """
+        queue_data = self._queue_data.get(queue.queue_id)
+        # prev_item is gone when the player dropped its current item before we got here; the
+        # queue's last item is the one that finished, so fall back to that
+        ending_item = prev_item or (
+            queue_data.items[-1] if queue_data and queue_data.items else None
+        )
+        if ending_item is not None and ending_item.media_type in UNENDABLE_MEDIA_TYPES:
+            # normally caught before the debounce; reachable only when prev_item was lost
+            return
+        self.logger.info("End of queue reached for %s, marking it as ended", queue.display_name)
+        self.mark_ended(queue.queue_id)
+
+    def _handle_sleep_timer(
+        self, queue: PlayerQueue, prev_state: CompareState, new_state: CompareState
+    ) -> None:
+        """Stop the queue once it reaches the point its sleep timer waits for."""
+        queue_id = queue.queue_id
+        queue_data = self._queue_data[queue_id]
+        if (
+            new_state["state"] == PlaybackState.PLAYING
+            and prev_state["state"] != PlaybackState.PLAYING
+        ):
+            # playing again: a stop a sleep timer made before no longer ends the queue
+            queue_data.sleep_timer_stopped_target = None
+        target = queue_data.sleep_timer_target
+        if target is None:
+            return
+        queue_player = self.mass.players.get_player(queue_id)
+        if queue_player and queue_player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
+            # an announcement takes the player and resumes the queue, which re-pins the target
+            return
+        if not queue.active:
+            # another source took the player, there is nothing left to stop
+            self._clear_sleep_timer(queue_id)
+            return
+        if new_state["state"] == PlaybackState.IDLE:
+            if prev_state["state"] != PlaybackState.PLAYING:
+                # an idle paused player (a pause timeout) still stops at the target once resumed
+                return
+            if (
+                prev_state["current_item_id"] == target.queue_item_id
+                and prev_state["last_playing_elapsed_time"]
+                >= target.stop_position - SLEEP_TIMER_NATURAL_END_MARGIN
+            ) or (
+                # audio that ends before its stated duration runs the flow stream out early
+                queue.flow_mode
+                and queue_data.session_id is not None
+                and queue_data.flow_queue_exhausted == queue_data.session_id
+            ):
+                # the player ran out of audio at the target: the queue feeds nothing past it
+                self._stop_for_sleep_timer(queue_id)
+            else:
+                # the player stopped on its own before the target: a plain stop keeps its place
+                self._clear_sleep_timer(queue_id)
+            return
+        current_item_id = new_state["current_item_id"]
+        if current_item_id is None or (
+            current_item_id != target.queue_item_id
+            and current_item_id == prev_state["current_item_id"]
+        ):
+            # between items, or a report that lags behind a switch: the next one names the item
+            return
+        # a player that holds its next item, or the target as its own repeat, moves on from the
+        # end of the target on its own
+        left_target = prev_state["current_item_id"] == target.queue_item_id
+        left_target_end = (
+            left_target
+            and prev_state["last_playing_elapsed_time"]
+            >= target.stop_position - SLEEP_TIMER_NATURAL_END_MARGIN
+        )
+        if current_item_id != target.queue_item_id:
+            # the item handed to the player ahead of time follows the target's real end, which
+            # can come well before its stated duration
+            if left_target_end or (
+                left_target and current_item_id == queue_data.next_item_id_enqueued
+            ):
+                self._stop_for_sleep_timer(queue_id)
+            else:
+                # a skip on the device: stop at the end of what plays now
+                self._repin_sleep_timer(queue_id)
+            return
+        # the position jumped back to the start: the player started the target over. A short
+        # target also passes the end margin during ordinary playback, which only moves forward
+        started_over = (
+            left_target_end
+            and queue.corrected_elapsed_time < SLEEP_TIMER_NATURAL_END_MARGIN
+            and queue.corrected_elapsed_time < prev_state["last_playing_elapsed_time"] - 1
+        )
+        if new_state["state"] == PlaybackState.PLAYING and (
+            queue.corrected_elapsed_time >= target.stop_position or started_over
+        ):
+            self._stop_for_sleep_timer(queue_id)
+            return
+        self._update_player_sleep_timer(queue)
+
+    def _handle_playback_progress_report(
+        self,
+        queue: PlayerQueue,
+        prev_state: CompareState,
+        new_state: CompareState,
+        record_play: bool = True,
+    ) -> None:
+        """
+        Handle playback progress report.
+
+        :param queue: The queue whose playback progressed.
+        :param prev_state: The queue state before this update.
+        :param new_state: The queue state after this update.
+        :param record_play: False to only report to the provider that streamed the item.
+        """
+        queue_data = self._queue_data[queue.queue_id]
+        # detect change in current index to report that a item has been played
+        prev_item_id = prev_state["current_item_id"]
+        cur_item_id = new_state["current_item_id"]
+        if prev_item_id is None and cur_item_id is None:
+            return
+
+        if prev_item_id is not None and prev_item_id != cur_item_id:
+            # we have a new item, so we need report the previous one
+            is_current_item = False
+            item_to_report = prev_state["current_item"]
+            seconds_played = int(prev_state["last_playing_elapsed_time"])
+        else:
+            # report on current item
+            is_current_item = True
+            item_to_report = self.get_item(queue.queue_id, cur_item_id) or new_state["current_item"]
+            if new_state["state"] == PlaybackState.PLAYING:
+                seconds_played = int(new_state["elapsed_time"])
+            else:
+                # a player may reset its position on pause/stop, never report less than it played
+                seconds_played = max(
+                    int(new_state["elapsed_time"]), int(new_state["last_playing_elapsed_time"])
+                )
+
+        if not item_to_report:
+            return  # guard against invalid items
+
+        if not (media_item := item_to_report.media_item):
+            # only report on media items
+            return
+        assert media_item.uri is not None  # uri is set in __post_init__
+
+        if item_to_report.streamdetails and item_to_report.streamdetails.stream_error:
+            # an item that had a stream error is not recorded as played, but the provider that
+            # streamed it still learns that its playback ended
+            record_play = False
+
+        if item_to_report.queue_item_id not in queue_data.served_item_ids:
+            # the player named an item it never received audio for (one from its own cached
+            # copy of the queue that the stream server then refused): nothing of it has played,
+            # whatever position the player reports for it
+            return
+
+        # a preloaded item is only probed once it actually streams
+        self._apply_probed_duration(item_to_report)
+
+        if item_to_report.streamdetails and item_to_report.streamdetails.duration:
+            duration = int(item_to_report.streamdetails.duration)
+        else:
+            duration = int(item_to_report.duration or 3 * 3600)
+
+        # a short item can end before a position past the floor below was ever reported. It played
+        # to its end when no load started a session since it was served and the queue moved on itself
+        played_to_end = (
+            seconds_played >= duration - PLAYED_TO_END_MARGIN
+            and queue_data.served_item_ids[item_to_report.queue_item_id]
+            == queue_data.started_session_id
+            and (
+                new_state["state"] == PlaybackState.PLAYING
+                if not is_current_item
+                else new_state["state"] == PlaybackState.IDLE and not queue_data.halted_by_command
+            )
+        )
+        if seconds_played < 5 and not played_to_end:
+            # ignore items that have been played less than 5 seconds
+            # this also filters out a bounce effect where the previous item
+            # gets reported with 0 elapsed seconds after a new item starts playing
+            record_play = False
+
+        if (
+            prev_state.get("state") != PlaybackState.PLAYING.value
+            and not duration < PLAYBACK_REPORT_INTERVAL_SECONDS
+        ):
+            # Do not report when resuming from idle or paused.
+            # (unless track has less seconds than PLAYBACK_REPORT_INTERVAL_SECONDS).
+            # Handles edge case: Queue still holds an audiobook/ podcast, and is paused/ idle.
+            # Audiobook is continued outside of MA. Then playback of another media item is
+            # started in MA on that queue. This triggers a progress report with the old position
+            # overwriting the newest one.
+            # We still want to report when transitioning to pause or idle.
+            record_play = False
+
+        # determine if item is fully played
+        # for podcasts and audiobooks we account for the last 60 seconds
+        percentage_played = percentage(seconds_played, duration)
+        if played_to_end:
+            fully_played = True
+        elif not is_current_item and item_to_report.media_type in (
+            MediaType.AUDIOBOOK,
+            MediaType.PODCAST_EPISODE,
+        ):
+            fully_played = seconds_played >= duration - 60
+        elif not is_current_item:
+            # 90% of the track must be played to be considered fully played
+            fully_played = percentage_played >= 90
+        else:
+            fully_played = seconds_played >= duration - 10
+
+        is_playing = is_current_item and queue.state == PlaybackState.PLAYING
+
+        if record_play and self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
+            self.logger.debug(
+                "%s %s '%s' (%s) - Fully played: %s - Progress: %s (%s/%ss)",
+                queue.display_name,
+                "is playing" if is_playing else "played",
+                item_to_report.name,
+                item_to_report.uri,
+                fully_played,
+                f"{percentage_played}%",
+                seconds_played,
+                duration,
+            )
+        # add entry to playlog - this also handles resume of podcasts/audiobooks
+        if record_play and self._should_mark_played(
+            queue.queue_id, item_to_report.queue_item_id, fully_played, is_playing
+        ):
+            self.mass.create_task(
+                self.mass.music.mark_item_played(
+                    media_item,
+                    fully_played=fully_played,
+                    seconds_played=seconds_played,
+                    is_playing=is_playing,
+                    userid=queue_data.userid,
+                    queue_id=queue.queue_id,
+                    user_initiated=self._is_user_initiated_play(queue_data, media_item),
+                    playback_speed=float(
+                        item_to_report.extra_attributes.get("playback_speed") or 1.0
+                    )
+                    if item_to_report.media_type in (MediaType.AUDIOBOOK, MediaType.PODCAST_EPISODE)
+                    else None,
+                )
+            )
+            if not is_playing and isinstance(media_item, Audiobook | PodcastEpisode):
+                # a later pass over the queue resumes from this, not from the enqueue-time bookmark
+                media_item.fully_played = fully_played
+                media_item.resume_position_ms = 0 if fully_played else seconds_played * 1000
+            if fully_played and not is_playing:
+                if credit_album := self._claim_album_credit(queue_data, item_to_report):
+                    self.mass.create_task(
+                        self._mark_album_played(credit_album, media_item, queue_data)
+                    )
+
+        album: Album | ItemMapping | None = getattr(media_item, "album", None)
+        artists: list[Artist | ItemMapping] = getattr(media_item, "artists", [])
+        artists_names = [a.name for a in artists]
+        report = MediaItemPlaybackProgressReport(
+            uri=media_item.uri,
+            media_type=media_item.media_type,
+            name=media_item.name,
+            version=getattr(media_item, "version", None),
+            artist=(
+                getattr(media_item, "artist_str", None) or artists_names[0]
+                if artists_names
+                else None
+            ),
+            artists=artists_names,
+            artist_mbids=[a.mbid for a in artists if a.mbid] if artists else None,
+            album=album.name if album else None,
+            album_mbid=album.mbid if album else None,
+            album_artist=(album.artist_str if isinstance(album, Album) else None),
+            album_artist_mbids=(
+                [a.mbid for a in album.artists if a.mbid] if isinstance(album, Album) else None
+            ),
+            image_url=(
+                self.mass.metadata.get_image_url(
+                    item_to_report.media_item.image, prefer_proxy=False
+                )
+                if item_to_report.media_item.image
+                else None
+            ),
+            duration=duration,
+            mbid=(getattr(media_item, "mbid", None)),
+            seconds_played=seconds_played,
+            fully_played=fully_played,
+            is_playing=is_playing,
+            userid=queue_data.userid,
+            player_id=queue.queue_id,
+        )
+        if record_play:
+            # signal 'media item played' event for external clients (e.g. Home Assistant);
+            # scrobbler plugins receive the same report through their own hook
+            self.mass.signal_event(
+                EventType.MEDIA_ITEM_PLAYED,
+                object_id=media_item.uri,
+                data=report,
+            )
+            self._report_to_scrobblers(report)
+        state = (
+            queue.state
+            if is_current_item and queue.state in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+            else PlaybackState.IDLE
+        )
+        self._report_to_streaming_provider(item_to_report, report, state)
+
+    def _report_to_scrobblers(self, report: MediaItemPlaybackProgressReport) -> None:
+        """Hand a playback progress report to every loaded scrobbler plugin."""
+        if self.mass.closing:
+            return
+        for scrobbler in self.mass.get_providers_supporting_feature(
+            ProviderFeature.SCROBBLE, priority=(ProviderType.PLUGIN,)
+        ):
+            if not isinstance(scrobbler, PluginProvider):
+                # the lookup returns plugins only; this narrows the type for mypy
+                continue
+            if scrobbler.unloading:
+                # its clients may already be torn down
+                continue
+            # one task per plugin, so a slow or failing scrobbler never holds up the others
+            self.mass.create_task(scrobbler.on_media_item_played(report))
+
+    def _report_to_streaming_provider(
+        self, item: QueueItem, report: MediaItemPlaybackProgressReport, state: PlaybackState
+    ) -> None:
+        """Hand a playback progress report to the music provider that streamed the item."""
+        if self.mass.closing or not (streamdetails := item.streamdetails):
+            return
+        # never another account of the same service, which did not stream the item
+        music_prov = exact_provider(self.mass, streamdetails.provider)
+        if not isinstance(music_prov, MusicProvider) or music_prov.unloading:
+            return
+        self.mass.create_task(music_prov.on_playback_progress(report, streamdetails.item_id, state))
+
+    def _claim_album_credit(
+        self, queue_data: PlayerQueueData, queue_item: QueueItem
+    ) -> Album | ItemMapping | None:
+        """
+        Claim the album play this track credits, or None when there is nothing to credit.
+
+        Only a track played from an album, or from the album's own folder, is eligible, and
+        only the first of the album's tracks to complete, so an album play is credited once
+        however its tracks ended up ordered in the queue. Claiming marks the album as credited
+        on this queue, so a second call for it returns None until the album is played again.
+
+        :param queue_data: The queue the track played on.
+        :param queue_item: The queue item of the track that played to the end.
+        """
+        album = played_from_album(queue_item)
+        if album is None or album.uri in queue_data.credited_albums:
+            return None
+        # a credit only matters while tracks of its album are on the queue
+        queue_data.credited_albums.intersection_update(
+            queued.uri for item in queue_data.items if (queued := played_from_album(item))
+        )
+        queue_data.credited_albums.add(cast("str", album.uri))
+        # credit the library album the track carries when it is this album, so the play lands
+        # on the row an explicit library play writes instead of a second provider-scoped one
+        track_album = getattr(queue_item.media_item, "album", None)
+        if isinstance(track_album, Album) and compare_item_ids(track_album, album):
+            return track_album
+        return album
+
+    def _is_user_initiated_play(
+        self, queue_data: PlayerQueueData, media_item: MediaItemType
+    ) -> bool:
+        """Return whether a played item was explicitly chosen by the user."""
+        # a played item is reported in its library shape while the enqueued item may still be
+        # the provider one it was picked from. The media type is compared alongside it because
+        # the library numbers each type from one, so ids collide freely across types.
+        return any(
+            item.media_type == media_item.media_type and compare_item_ids(item, media_item)
+            for item in queue_data.enqueued_media_items
+        )
+
+    async def _mark_album_played(
+        self, album: Album | ItemMapping, track: MediaItemType, queue_data: PlayerQueueData
+    ) -> None:
+        """Mark an album played, skipping artists already credited via its track."""
+        self.logger.debug(
+            "Credited album '%s' as played (triggered by track '%s')", album.name, track.name
+        )
+        skip = await self.mass.music.resolve_library_artist_ids(getattr(track, "artists", []))
+        await self.mass.music.mark_item_played(
+            album,
+            userid=queue_data.userid,
+            queue_id=queue_data.queue.queue_id,
+            user_initiated=True,
+            skip_artist_ids=list(skip),
+        )
+
+    def _should_mark_played(
+        self, queue_id: str, queue_item_id: str, fully_played: bool, is_playing: bool
+    ) -> bool:
+        """
+        Return whether this playback report should be forwarded to ``mark_item_played``.
+
+        :param queue_id: The id of the queue the report belongs to.
+        :param queue_item_id: The id of the queue item being reported.
+        :param fully_played: Whether the item was played to completion.
+        :param is_playing: Whether the item is still playing.
+        """
+        queue_data = self._queue_data[queue_id]
+        if fully_played and not is_playing:
+            # the final queue track is reported twice at end-of-queue; skip the duplicate
+            # so a completed play is only counted once
+            if queue_data.last_counted_play == queue_item_id:
+                return False
+            queue_data.last_counted_play = queue_item_id
+            return True
+        # a not-fully-played report for the same item means it restarted (e.g. on repeat),
+        # so re-arm the guard to count its next completion
+        if not fully_played and queue_data.last_counted_play == queue_item_id:
+            queue_data.last_counted_play = None
+        return True

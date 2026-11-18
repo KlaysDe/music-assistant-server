@@ -1,0 +1,50 @@
+{
+  "config_entries": {
+    "label_text": {
+      "label": "Successfully signed in as {0} {1}."
+    },
+    "sign_in": {
+      "label": "Sign in with an ARD account",
+      "description": "Link your ARD account to sync your subscriptions and listening progress. You confirm the login in your browser on accounts.ard.de."
+    },
+    "max_num_episodes": {
+      "label": "Maximum bitrate for streams (0 for unlimited)",
+      "description": "Maximum bitrate for streams. Use 0 for unlimited"
+    },
+    "podcast_finished_time": {
+      "label": "Percentage required before podcast episode is marked as fully played",
+      "description": "This setting defines how much of a podcast must be listened to before an episode is marked as fully played"
+    },
+    "token": {
+      "label": "token"
+    },
+    "user_id": {
+      "label": "uid"
+    },
+    "token_expiry": {
+      "label": "token_expiry"
+    },
+    "display_name": {
+      "label": "username"
+    },
+    "refresh_token": {
+      "label": "refresh_token"
+    }
+  },
+  "setup_flow": {
+    "user": {
+      "title": "Set up ARD Sounds",
+      "description": "ARD Sounds works without an account. Sign in to sync your subscriptions and listening progress with your ARD account."
+    },
+    "device_login": {
+      "title": "Sign in to your ARD account",
+      "description": "Your code is {0}. Use the button below to open the ARD login with the code already filled in, or go to accounts.ard.de/id on another device and enter it there. This screen updates automatically once you have signed in."
+    }
+  },
+  "errors": {
+    "login_failed": "Signing in to your ARD account failed. Please try again."
+  },
+  "manifest": {
+    "description": "Stream radio shows, news, and podcasts from ARD Sounds (Germany’s public broadcaster)."
+  }
+}

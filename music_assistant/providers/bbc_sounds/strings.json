@@ -1,0 +1,49 @@
+{
+  "config_entries": {
+    "username": {
+      "label": "Email or username"
+    },
+    "password": {
+      "label": "[%key:common::config_entries::password::label%]"
+    },
+    "intro": {
+      "label": "A BBC Sounds account is optional, but some UK-only content may not work without it"
+    }
+  },
+  "media": {
+    "folder": {
+      "catch_up": {
+        "name": "Catch-up Radio"
+      },
+      "schedules": {
+        "name": "Station Schedules"
+      },
+      "schedule": {
+        "name": "Schedule"
+      },
+      "local_radio": {
+        "name": "Local Radio"
+      },
+      "international_radio": {
+        "name": "International Radio"
+      },
+      "live": {
+        "name": "Live Radio"
+      },
+      "today": {
+        "name": "Today"
+      },
+      "yesterday": {
+        "name": "Yesterday"
+      }
+    }
+  },
+  "menu_actions": {
+    "listen_from_start": {
+      "label": "Listen from start"
+    }
+  },
+  "manifest": {
+    "description": "Stream live BBC radio shows, podcast series and on-demand audio."
+  }
+}

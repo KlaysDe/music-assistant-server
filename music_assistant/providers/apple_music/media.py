@@ -1,0 +1,430 @@
+"""Catalog and media lookups for Apple Music."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, cast
+
+from music_assistant_models.enums import ExternalID, MediaType
+from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
+from music_assistant_models.media_items import (
+    Album,
+    Artist,
+    Playlist,
+    SearchResults,
+    Track,
+)
+
+from music_assistant.controllers.cache import forget_cached, use_cache
+from music_assistant.helpers.external_ids import (
+    barcode_to_upc,
+    is_valid_barcode,
+    is_valid_isrc,
+    normalize_external_id,
+)
+from music_assistant.helpers.track_filter import filter_tracks
+from music_assistant.models.music_provider import ARTIST_ALBUMS_LIMIT
+
+from .constants import (
+    ARTWORK_CACHE_EXPIRATION,
+    PARSED_ITEM_CACHE_CHECKSUM,
+    PLAYLIST_LAST_MODIFIED_CACHE_EXPIRATION,
+)
+from .helpers.utils import is_catalog_id, is_library_id, translate_media_type_to_apple_type
+from .parsers import (
+    format_artwork_url,
+    parse_album,
+    parse_artist,
+    parse_playlist,
+    parse_station,
+    parse_track,
+)
+
+if TYPE_CHECKING:
+    from .provider import AppleMusicProvider
+
+
+class AppleMusicMediaManager:
+    """Handles catalog reads and search for Apple Music."""
+
+    # Lookups here leave the favorite state unset: it comes from the library sync, which
+    # fetches ratings in batches, while a ratings call per lookup would double the requests
+    # against the shared, rate limited developer token.
+
+    def __init__(self, provider: AppleMusicProvider) -> None:
+        """Initialize media manager."""
+        self.provider = provider
+        self.mass = provider.mass
+        self.instance_id = provider.instance_id
+        self.domain = provider.domain
+        self.api = provider.api_client
+        self.logger = provider.logger
+
+    @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def search(
+        self,
+        search_query: str,
+        media_types: list[MediaType] | None,
+        limit: int = 5,
+    ) -> SearchResults:
+        """Perform search on the Apple Music catalog."""
+        endpoint = f"catalog/{self.provider._storefront}/search"
+        limit = min(limit, 25)
+        searchresult = SearchResults()
+        if not media_types:
+            return searchresult
+        searchtypes = []
+        if MediaType.ARTIST in media_types:
+            searchtypes.append("artists")
+        if MediaType.ALBUM in media_types:
+            searchtypes.append("albums")
+        if MediaType.TRACK in media_types:
+            searchtypes.append("songs")
+        if MediaType.PLAYLIST in media_types:
+            searchtypes.append("playlists")
+        if MediaType.RADIO in media_types:
+            searchtypes.append("stations")
+        if not searchtypes:
+            return searchresult
+        searchtype = ",".join(searchtypes)
+        search_query = search_query.replace("'", "")
+        response = await self.api.get_data(
+            endpoint, term=search_query, types=searchtype, limit=limit
+        )
+        if "artists" in response["results"]:
+            searchresult.artists = [
+                *searchresult.artists,
+                *(
+                    parse_artist(self.provider, item)
+                    for item in response["results"]["artists"]["data"]
+                ),
+            ]
+        if "albums" in response["results"]:
+            searchresult.albums = [
+                *searchresult.albums,
+                *(
+                    cast("Album", parse_album(self.provider, item))
+                    for item in response["results"]["albums"]["data"]
+                ),
+            ]
+        if "songs" in response["results"]:
+            searchresult.tracks = [
+                *searchresult.tracks,
+                *(
+                    parse_track(self.provider, item)
+                    for item in response["results"]["songs"]["data"]
+                ),
+            ]
+        if "playlists" in response["results"]:
+            searchresult.playlists = [
+                *searchresult.playlists,
+                *(
+                    parse_playlist(self.provider, item)
+                    for item in response["results"]["playlists"]["data"]
+                ),
+            ]
+        if "stations" in response["results"]:
+            searchresult.radio = [
+                *searchresult.radio,
+                *(
+                    parse_station(self.provider, item)
+                    for item in response["results"]["stations"]["data"]
+                ),
+            ]
+        return searchresult
+
+    @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def get_artist(self, prov_artist_id: str) -> Artist:
+        """Get full artist details by id."""
+        endpoint = f"catalog/{self.provider._storefront}/artists/{prov_artist_id}"
+        response = await self.api.get_data(endpoint, extend="editorialNotes")
+        return cast("Artist", parse_artist(self.provider, response["data"][0]))
+
+    @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def get_album(self, prov_album_id: str) -> Album:
+        """Get full album details by id."""
+        if is_library_id(prov_album_id):
+            endpoint = f"me/library/albums/{prov_album_id}"
+            response = await self.api.get_data(endpoint, include="catalog,artists")
+        else:
+            endpoint = f"catalog/{self.provider._storefront}/albums/{prov_album_id}"
+            response = await self.api.get_data(endpoint, include="artists")
+        return cast("Album", parse_album(self.provider, response["data"][0]))
+
+    @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def get_track(self, prov_track_id: str) -> Track:
+        """Get full track details by id."""
+        if is_library_id(prov_track_id):
+            endpoint = f"me/library/songs/{prov_track_id}"
+            response = await self.api.get_data(endpoint, include="catalog,artists,albums")
+        else:
+            endpoint = f"catalog/{self.provider._storefront}/songs/{prov_track_id}"
+            response = await self.api.get_data(endpoint, include="artists,albums")
+        track = parse_track(self.provider, response["data"][0])
+        await self.provider.library_manager.mark_purchases_on_sale([(response["data"][0], track)])
+        return track
+
+    async def get_playlist(
+        self,
+        prov_playlist_id: str,
+        is_favourite: bool | None = None,
+        can_edit_hint: bool | None = None,
+        library_id_override: str | None = None,
+    ) -> Playlist:
+        """Get full playlist details by id."""
+        return await self._get_regular_playlist(
+            prov_playlist_id,
+            is_favourite,
+            can_edit_hint=can_edit_hint,
+            library_id_override=library_id_override,
+        )
+
+    @use_cache(ARTWORK_CACHE_EXPIRATION, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def get_artwork_url(self, media_type: str, prov_item_id: str) -> str | None:
+        """
+        Return the current artwork URL for the given item, if any.
+
+        Blobstore artwork URLs are presigned with a limited lifetime, so they are
+        resolved on demand (and cached well below the signature lifetime) instead
+        of being persisted anywhere.
+
+        :param media_type: The media type value of the artwork token (album/track/...).
+        :param prov_item_id: The provider item id of the item the artwork belongs to.
+        """
+        try:
+            apple_type = translate_media_type_to_apple_type(MediaType(media_type))
+        except ValueError, MusicAssistantError:
+            return None
+        # playlists use globalId ("pl.") catalog ids; all other types use the
+        # library id format to tell library and catalog items apart
+        if media_type == MediaType.PLAYLIST.value:
+            in_library = not is_catalog_id(prov_item_id)
+        else:
+            in_library = is_library_id(prov_item_id)
+        if in_library:
+            endpoint = f"me/library/{apple_type}/{prov_item_id}"
+        else:
+            endpoint = f"catalog/{self.provider._storefront}/{apple_type}/{prov_item_id}"
+        response = await self.api.get_data(endpoint, include="catalog")
+        item_obj = response["data"][0]
+        attributes = item_obj.get("attributes") or {}
+        if not attributes.get("artwork"):
+            # library items may only carry artwork on their catalog counterpart
+            catalog_data = item_obj.get("relationships", {}).get("catalog", {}).get("data") or []
+            if catalog_data:
+                attributes = catalog_data[0].get("attributes") or {}
+        return format_artwork_url(attributes)
+
+    @use_cache(3600 * 24 * 7, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM, allow_expired_cache=True)
+    async def get_track_by_external_id(
+        self, external_id: str, external_id_type: ExternalID
+    ) -> Track | None:
+        """Retrieve track by external ID (ISRC)."""
+        if external_id_type != ExternalID.ISRC:
+            return None
+
+        endpoint = f"catalog/{self.provider._storefront}/songs"
+        if not is_valid_isrc(external_id):
+            return None
+        normalized_isrc = normalize_external_id(ExternalID.ISRC, external_id)
+        try:
+            response = await self.api.get_data(
+                endpoint,
+                include="artists,albums",
+                **{"filter[isrc]": normalized_isrc},
+            )
+            if not response.get("data"):
+                return None
+            return parse_track(self.provider, response["data"][0])
+        except MediaNotFoundError:
+            return None
+
+    @use_cache(3600 * 24 * 7, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM, allow_expired_cache=True)
+    async def get_album_by_external_id(
+        self, external_id: str, external_id_type: ExternalID
+    ) -> Album | None:
+        """Retrieve album by external ID (UPC/Barcode)."""
+        if external_id_type != ExternalID.BARCODE:
+            return None
+
+        endpoint = f"catalog/{self.provider._storefront}/albums"
+        if not is_valid_barcode(external_id):
+            return None
+        normalized_upc = barcode_to_upc(external_id)
+        try:
+            response = await self.api.get_data(
+                endpoint,
+                include="artists",
+                **{"filter[upc]": normalized_upc},
+            )
+            if not response.get("data"):
+                return None
+            return cast("Album | None", parse_album(self.provider, response["data"][0]))
+        except MediaNotFoundError:
+            return None
+
+    async def forget_playlist_tracks(self, prov_playlist_id: str) -> None:
+        """Drop the kept pages of a playlist and its change marker, so they are fetched anew."""
+        await forget_cached(self._get_playlist_last_modified, prov_playlist_id)
+        await forget_cached(self._get_playlist_tracks_cached, prov_playlist_id)
+
+    async def get_station_tracks(self, station_id: str) -> list[Track]:
+        """Fetch the next batch of tracks for a radio station."""
+        tracks = await self._fetch_station_tracks(station_id)
+        if not tracks:
+            # Apple may rotate station IDs for personal stations; try to resolve the current one.
+            fresh_id = await self.provider.recommendation_manager.resolve_station_id(station_id)
+            if fresh_id and fresh_id != station_id:
+                self.logger.debug(
+                    "Station ID %s appears stale, retrying with refreshed ID %s",
+                    station_id,
+                    fresh_id,
+                )
+                tracks = await self._fetch_station_tracks(fresh_id)
+        return filter_tracks(tracks)
+
+    @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def _get_regular_playlist(
+        self,
+        prov_playlist_id: str,
+        is_favourite: bool | None = None,
+        can_edit_hint: bool | None = None,
+        library_id_override: str | None = None,
+    ) -> Playlist:
+        """Fetch and cache details for a playlist."""
+        response = await self.api.get_data(self._playlist_endpoint(prov_playlist_id))
+        return parse_playlist(
+            self.provider,
+            response["data"][0],
+            is_favourite,
+            can_edit_hint=can_edit_hint,
+            library_id_override=library_id_override,
+        )
+
+    @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM, allow_expired_cache=True)
+    async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
+        """Get all album tracks for given album id."""
+        if is_library_id(prov_album_id):
+            endpoint = f"me/library/albums/{prov_album_id}/tracks"
+            response = await self.api.get_data(endpoint, include="catalog,artists")
+        else:
+            endpoint = f"catalog/{self.provider._storefront}/albums/{prov_album_id}/tracks"
+            response = await self.api.get_data(endpoint, include="artists")
+        tracks = []
+        listed: list[tuple[dict[str, Any], Track]] = []
+        for track_obj in response["data"]:
+            if "id" not in track_obj:
+                continue
+            track = parse_track(self.provider, track_obj)
+            listed.append((track_obj, track))
+            # the listing omits the album relation, so parse_track would make the album name
+            # stand in as its id; callers attach the album they asked for instead, which saves
+            # fetching it again for every album a library sync imports
+            track.album = None
+            tracks.append(track)
+        await self.provider.library_manager.mark_purchases_on_sale(listed)
+        return tracks
+
+    async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
+        """Get all playlist tracks for given playlist id."""
+        last_modified = await self._get_playlist_last_modified(prov_playlist_id)
+        return await self._get_playlist_tracks_cached(prov_playlist_id, page, last_modified)
+
+    # the change marker is part of the cache key, so an unchanged playlist is served from
+    # cache for a week and a changed one refetches at once
+    @use_cache(3600 * 24 * 7, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def _get_playlist_tracks_cached(
+        self, prov_playlist_id: str, page: int, last_modified: str | None
+    ) -> list[Track]:
+        """Fetch and cache tracks for a playlist."""
+        if is_catalog_id(prov_playlist_id):
+            endpoint = f"catalog/{self.provider._storefront}/playlists/{prov_playlist_id}/tracks"
+        else:
+            endpoint = f"me/library/playlists/{prov_playlist_id}/tracks"
+        result: list[Track] = []
+        page_size = 100
+        offset = page * page_size
+        response = await self.api.get_data(
+            endpoint, include="artists,catalog", limit=page_size, offset=offset
+        )
+        if not response or "data" not in response:
+            return result
+        listed: list[tuple[dict[str, Any], Track]] = []
+        for index, track in enumerate(response["data"]):
+            if track and track["id"]:
+                parsed_track = parse_track(self.provider, track)
+                parsed_track.position = offset + index + 1
+                result.append(parsed_track)
+                listed.append((track, parsed_track))
+        await self.provider.library_manager.mark_purchases_on_sale(listed)
+        return result
+
+    async def _fetch_station_tracks(self, station_id: str) -> list[Track]:
+        """Fetch tracks for a station ID from the Apple Music API."""
+        response = await self.api.post_data(
+            f"me/stations/next-tracks/{station_id}", include="artists"
+        )
+        tracks = response.get("data", [])
+        if not tracks:
+            self.logger.debug(
+                "No tracks returned for station_id=%s; errors=%s",
+                station_id,
+                response.get("errors"),
+            )
+            return []
+        return [parse_track(self.provider, t) for t in tracks if t and t.get("id")]
+
+    @use_cache(3600 * 24 * 7, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM, allow_expired_cache=True)
+    async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
+        """Get a list of albums for the given artist."""
+        endpoint = f"catalog/{self.provider._storefront}/artists/{prov_artist_id}/albums"
+        albums: list[Album] = []
+        try:
+            async for album in self.api.iter_all_items(endpoint):
+                if not album["id"]:
+                    continue
+                parsed = parse_album(self.provider, album)
+                if parsed:
+                    albums.append(cast("Album", parsed))
+                if len(albums) >= ARTIST_ALBUMS_LIMIT:
+                    break
+        except MediaNotFoundError:
+            self.logger.info("No albums found for artist %s", prov_artist_id)
+            return []
+        return albums
+
+    @use_cache(3600 * 24 * 7, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM, allow_expired_cache=True)
+    async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
+        """Get a list of 10 most popular tracks for the given artist."""
+        endpoint = f"catalog/{self.provider._storefront}/artists/{prov_artist_id}/view/top-songs"
+        try:
+            response = await self.api.get_data(endpoint)
+        except MediaNotFoundError:
+            self.logger.info("No top tracks found for artist %s", prov_artist_id)
+            return []
+        return [parse_track(self.provider, track) for track in response["data"] if track["id"]]
+
+    # a forced refresh reads every page fresh, so the marker lookup stays cached rather than
+    # costing one request per page
+    @use_cache(PLAYLIST_LAST_MODIFIED_CACHE_EXPIRATION, allow_bypass=False)
+    async def _get_playlist_last_modified(self, prov_playlist_id: str) -> str | None:
+        """Return a marker that moves whenever the playlist's contents change."""
+        endpoint = self._playlist_endpoint(prov_playlist_id)
+        if is_catalog_id(prov_playlist_id):
+            response = await self.api.get_data(endpoint)
+            last_modified: str | None = response["data"][0]["attributes"].get("lastModifiedDate")
+            return last_modified
+        # a library playlist that follows a catalog playlist keeps its own date when Apple
+        # updates the catalog contents, so the catalog playlist's date joins the marker
+        response = await self.api.get_data(endpoint, include="catalog")
+        playlist = response["data"][0]
+        catalog = playlist.get("relationships", {}).get("catalog", {}).get("data") or []
+        dates = [
+            item.get("attributes", {}).get("lastModifiedDate") for item in (playlist, *catalog)
+        ]
+        return "|".join(filter(None, dates)) or None
+
+    def _playlist_endpoint(self, prov_playlist_id: str) -> str:
+        """Return the catalog or library endpoint for a playlist."""
+        if is_catalog_id(prov_playlist_id):
+            return f"catalog/{self.provider._storefront}/playlists/{prov_playlist_id}"
+        return f"me/library/playlists/{prov_playlist_id}"

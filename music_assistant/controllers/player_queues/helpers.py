@@ -1,0 +1,523 @@
+"""Helper utilities for the player queues controller."""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import random
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import ExitStack, asynccontextmanager
+from typing import TYPE_CHECKING, Any, Concatenate, Protocol, TypedDict, TypeGuard, overload
+
+from music_assistant_models.enums import MediaType, PlaybackState, PlayerType, SleepTimerMode
+from music_assistant_models.errors import PlayerCommandFailed, PlayerUnavailableError
+from music_assistant_models.media_items import (
+    ItemMapping,
+    MediaItemMetadata,
+    Playlist,
+    Radio,
+    Track,
+)
+from music_assistant_models.queue_item import QueueItem, QueueItemOrigin
+
+from music_assistant.constants import EXTERNAL_ID_PROVIDER
+from music_assistant.controllers.player_queues.constants import (
+    PLAY_REQUEST_RESOLVE_TIMEOUT,
+    ArtistOrder,
+)
+from music_assistant.controllers.players.constants import SwitchedOffAction
+from music_assistant.helpers.external_ids import external_item_id, parse_external_item_id
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    from music_assistant_models.enums import ContentType
+    from music_assistant_models.media_items import (
+        Album,
+        BrowseFolder,
+        MediaItemType,
+        PlayableMediaItemType,
+    )
+    from music_assistant_models.player_queue import PlayerQueue
+
+    from music_assistant import MusicAssistant
+    from music_assistant.controllers.player_queues.state import PlayerQueueData
+    from music_assistant.models.player import Player
+
+
+class CompareState(TypedDict):
+    """
+    Simple object where we store the (previous) state of a queue.
+
+    Used for compare actions.
+    """
+
+    queue_id: str
+    state: PlaybackState
+    current_item_id: str | None
+    next_item_id: str | None
+    current_item: QueueItem | None
+    elapsed_time: int
+    # last_playing_elapsed_time: elapsed time from the last PLAYING state update
+    # used to determine if a track was fully played when transitioning to idle
+    last_playing_elapsed_time: int
+    stream_title: str | None
+    codec_type: ContentType | None
+    output_player_ids: list[str] | None
+
+
+class _PlayActionHost(Protocol):
+    """
+    The minimal controller surface that :func:`handle_play_action` needs.
+
+    Lets the decorator wrap actions defined either on the controller itself or on one
+    of its mixins, since both expose this surface at runtime.
+    """
+
+    mass: MusicAssistant
+    _queue_data: dict[str, PlayerQueueData]
+
+    def signal_update(self, queue_id: str, items_changed: bool = False) -> None: ...
+
+    def on_player_update(
+        self, player: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None: ...
+
+    def _drop_pending_step(self, queue_id: str) -> None: ...
+
+    def _show_play_action(
+        self, queue_id: str, *, while_playing: bool = False
+    ) -> AbstractContextManager[None]: ...
+
+
+@overload
+def handle_play_action[PlayActionHostT: _PlayActionHost, **P, R](
+    func: Callable[Concatenate[PlayActionHostT, P], Awaitable[R]],
+) -> Callable[Concatenate[PlayActionHostT, P], Coroutine[Any, Any, R | None]]: ...
+
+
+@overload
+def handle_play_action[PlayActionHostT: _PlayActionHost, **P, R](
+    func: None = None,
+    *,
+    switched_off: SwitchedOffAction = SwitchedOffAction.REFUSE,
+    starts_unless_playing: bool = False,
+) -> Callable[
+    [Callable[Concatenate[PlayActionHostT, P], Awaitable[R]]],
+    Callable[Concatenate[PlayActionHostT, P], Coroutine[Any, Any, R | None]],
+]: ...
+
+
+def handle_play_action[PlayActionHostT: _PlayActionHost, **P, R](
+    func: Callable[Concatenate[PlayActionHostT, P], Awaitable[R]] | None = None,
+    *,
+    switched_off: SwitchedOffAction = SwitchedOffAction.REFUSE,
+    starts_unless_playing: bool = False,
+) -> (
+    Callable[Concatenate[PlayActionHostT, P], Coroutine[Any, Any, R | None]]
+    | Callable[
+        [Callable[Concatenate[PlayActionHostT, P], Awaitable[R]]],
+        Callable[Concatenate[PlayActionHostT, P], Coroutine[Any, Any, R | None]],
+    ]
+):
+    """
+    Decorator for queue playback actions.
+
+    Acquires the playback lock for the queue's player, preceded by that of the group
+    holding the player (both re-entrant), and sets ATTR_PLAY_ACTION_IN_PROGRESS on the
+    queue while the action runs, and on a queue that does not play already while it waits
+    for players to start up. The action waits for a running one to finish and fails
+    with ResourceBusyError when that takes too long, rather than run alongside it.
+    Uses an internal refcount so nested actions don't clear the flag prematurely.
+
+    :param func: The function to wrap (when used without parentheses).
+    :param switched_off: What the action does with a queue whose player is switched off at
+        its external power control (see SwitchedOffAction), handled before the locks are
+        taken: refused by default, ignored, powered on first for actions that start
+        playback, or run as is for actions that handle it themselves. An action that powers
+        such a player on also waits for the switched-off members of the group player it
+        starts: the queue's player itself, or the group that its playback goes to.
+    :param starts_unless_playing: The action makes a queue that does not play start playing
+        (a seek), so on such a queue it waits for the switched-off members of a group player
+        as well. A queue whose player itself is switched off is handled as switched_off says.
+    """  # noqa: D401
+
+    def decorator(
+        fn: Callable[Concatenate[PlayActionHostT, P], Awaitable[R]],
+    ) -> Callable[Concatenate[PlayActionHostT, P], Coroutine[Any, Any, R | None]]:
+        @functools.wraps(fn)
+        async def wrapper(self: PlayActionHostT, /, *args: P.args, **kwargs: P.kwargs) -> R | None:
+            """Execute function with playback lock and play action flag set."""
+            queue_id = kwargs.get("queue_id") or args[0]
+            assert isinstance(queue_id, str)  # for type checking
+            queue_data = self._queue_data.get(queue_id)
+            if queue_data is None:
+                # a legacy id of the queue's player: the action works on the queue's own id
+                queue_id = self.mass.players.resolve_player_id(queue_id)
+                if (queue_data := self._queue_data.get(queue_id)) is None:
+                    return await fn(self, *args, **kwargs)
+                if "queue_id" in kwargs:
+                    kwargs["queue_id"] = queue_id
+                else:
+                    args = (queue_id, *args[1:])  # type: ignore[assignment]
+            if switched_off == SwitchedOffAction.POWER_ON or starts_unless_playing:
+                # the action takes the place of a step (next, previous) that has not played
+                # yet, from the moment it arrives
+                self._drop_pending_step(queue_id)
+            # the action shows on a queue that does not play from the start of its wait for
+            # players to start up; once it holds the locks it shows by itself
+            with ExitStack() as waiting:
+                if (
+                    player := self.mass.players.get_player(queue_id)
+                ) is not None and player.offline_by_power_control:
+                    if switched_off == SwitchedOffAction.REFUSE:
+                        msg = f"Player {player.name} is switched off"
+                        raise PlayerUnavailableError(
+                            msg,
+                            translation_key="player_switched_off",
+                            translation_owner=self.mass.players.translation_owner,
+                            translation_args=[player.name],
+                        )
+                    if switched_off == SwitchedOffAction.IGNORE:
+                        return None
+                    if switched_off == SwitchedOffAction.POWER_ON:
+                        waiting.enter_context(self._show_play_action(queue_id))
+                        await self.mass.players._power_on_switched_off_player(queue_id)
+                elif player is not None and (
+                    switched_off == SwitchedOffAction.POWER_ON
+                    or (
+                        starts_unless_playing
+                        and queue_data.queue.active
+                        and queue_data.queue.state != PlaybackState.PLAYING
+                    )
+                ):
+                    # the group player itself, or the group that the playback of a member goes to
+                    target = self.mass.players._resolve_play_media_target(player)
+                    if target.type == PlayerType.GROUP:
+                        if self.mass.players._members_to_power_on(target):
+                            waiting.enter_context(self._show_play_action(queue_id))
+                        await self.mass.players._power_on_members(target)
+                # a play action on the queue of a player captured by a (sync)group releases the
+                # player from it first, which takes the group's lock - so that one is taken
+                # before the player's own (see PlayerController.get_group_and_player_lock)
+                async with self.mass.players.get_group_and_player_lock(queue_id):
+                    # the queue can register anew while its player starts up: the action
+                    # shows on the queue that is registered by now
+                    with self._show_play_action(queue_id, while_playing=True):
+                        waiting.close()
+                        return await fn(self, *args, **kwargs)
+
+        return wrapper
+
+    # Support both @handle_play_action and @handle_play_action(switched_off=...)
+    if func is not None:
+        return decorator(func)
+    return decorator
+
+
+@asynccontextmanager
+async def play_request_deadline(translation_owner: str) -> AsyncIterator[None]:
+    """
+    Bound the resolution of what a play request plays to PLAY_REQUEST_RESOLVE_TIMEOUT.
+
+    A deadline that is already running around it is not extended.
+
+    :param translation_owner: The owner of the translated error.
+    :raises PlayerCommandFailed: When the deadline ran out; the body was cancelled.
+    """
+    timeout = asyncio.timeout(PLAY_REQUEST_RESOLVE_TIMEOUT)
+    try:
+        async with timeout:
+            yield
+    except TimeoutError as err:
+        # a timeout of the work itself is not the deadline
+        if not timeout.expired():
+            raise
+        msg = f"Resolving the media to play took longer than {PLAY_REQUEST_RESOLVE_TIMEOUT} seconds"
+        raise PlayerCommandFailed(
+            msg,
+            translation_key="play_request_timeout",
+            translation_owner=translation_owner,
+            translation_args=[PLAY_REQUEST_RESOLVE_TIMEOUT],
+        ) from err
+
+
+def is_dynamic_source(item: MediaItemType | BrowseFolder) -> TypeGuard[Playlist | Radio]:
+    """Return True if the item supplies its own on-demand track feed."""
+    return isinstance(item, Playlist | Radio) and item.is_dynamic
+
+
+def is_finite_radio(item: MediaItemType | BrowseFolder) -> TypeGuard[Radio]:
+    """Return True for a radio station with a fixed tracklist the queue plays out and ends."""
+    return isinstance(item, Radio) and not item.is_endless and not item.is_dynamic
+
+
+def find_dynamic_source(queue_data: PlayerQueueData) -> MediaItemType | None:
+    """
+    Return the queue's most recently added dynamic source, if it has one.
+
+    Prefers the queue's sources and falls back to what was enqueued on it.
+
+    :param queue_data: The queue to inspect.
+    """
+    for items in (queue_data.source_items, queue_data.enqueued_media_items):
+        for item in reversed(items):
+            if is_dynamic_source(item):
+                return item
+    return None
+
+
+def has_dynamic_source(source_items: list[MediaItemType]) -> bool:
+    """Return True if any source supplies its own on-demand track feed (the queue is dynamic)."""
+    return any(is_dynamic_source(item) for item in source_items)
+
+
+def build_queue_item(
+    queue_id: str, media_item: PlayableMediaItemType, origin: QueueItemOrigin | None = None
+) -> QueueItem:
+    """
+    Build a QueueItem for enqueueing, keeping its media item slim.
+
+    The returned item only carries the media details needed for the queue listing and stream
+    resolution. For tracks the full metadata is dropped; it is restored from the library when
+    the item becomes the queue's current or next item, so large queues stay light on memory
+    and persisted-cache size.
+
+    :param queue_id: The id of the queue the item is created for.
+    :param media_item: The source media item to enqueue.
+    :param origin: Where the item was played from, when it was played from a container.
+    """
+    queue_item = QueueItem.from_media_item(queue_id, media_item)
+    queue_item.origin = origin
+    if isinstance(queue_item.media_item, Track):
+        # the list-row artwork is already captured on QueueItem.image, so dropping the
+        # track's metadata here does not lose anything the queue listing still needs
+        queue_item.media_item.metadata = MediaItemMetadata()
+    return queue_item
+
+
+def can_be_enqueued(media_item: MediaItemType) -> bool:
+    """
+    Return whether a media item can go onto a queue.
+
+    A track known only by an external id is on no music source until the queue looks it
+    up when it loads it, so it counts like an item that is available.
+
+    :param media_item: The media item to check.
+    """
+    return media_item.available or media_item.provider == EXTERNAL_ID_PROVIDER
+
+
+def replace_media_item(queue_item: QueueItem, media_item: PlayableMediaItemType) -> None:
+    """
+    Make a queue item play another media item.
+
+    The queue item keeps its id, its place in the queue and its origin; its name, duration
+    and image follow the new media item.
+
+    :param queue_item: The queue item to change.
+    :param media_item: The media item it plays from now on.
+    """
+    derived = QueueItem.from_media_item(queue_item.queue_id, media_item)
+    queue_item.media_item = derived.media_item
+    queue_item.name = derived.name
+    queue_item.duration = derived.duration
+    queue_item.image = derived.image
+
+
+def external_track_placeholder(item_id: str) -> Track:
+    """
+    Return a track known only by an external id, named by that id.
+
+    :param item_id: Item id as external_item_id() builds it.
+    :raises InvalidProviderID: The item id is no valid external item id.
+    """
+    external_id_type, external_id = parse_external_item_id(item_id)
+    return Track(
+        item_id=external_item_id(external_id_type, external_id),
+        provider=EXTERNAL_ID_PROVIDER,
+        name=external_id,
+        external_ids={(external_id_type, external_id)},
+        provider_mappings=set(),
+    )
+
+
+def origin_for(
+    container: MediaItemType, item: MediaItemType, *, pin: bool = True
+) -> QueueItemOrigin:
+    """
+    Return the origin of an item that was played from the given container.
+
+    The container is always recorded. The item is pinned to the copy the container listed
+    when asked to, except for a library item, whose listing names no copy, and for an entry
+    of a Music Assistant (builtin) playlist, which carries an arbitrary provider identity.
+
+    :param container: The album, playlist, artist, genre, podcast or station the item was
+        played from.
+    :param item: The item as the container listed it.
+    :param pin: Whether to pin the item to the listed copy.
+    """
+    pinned = pin and item.provider != "library" and not _is_builtin_playlist(container)
+    return QueueItemOrigin(
+        container=ItemMapping.from_item(container),
+        provider_instance=item.provider if pinned else None,
+        item_id=item.item_id if pinned else None,
+    )
+
+
+def played_from_album(queue_item: QueueItem) -> ItemMapping | None:
+    """
+    Return the album a queue item was played from, if it was played from one.
+
+    An item played from an album folder, or from a disc subfolder of one, was played from
+    that album.
+
+    :param queue_item: The queue item to check.
+    """
+    container = queue_item.origin.container if queue_item.origin else None
+    if container is None or container.media_type != MediaType.ALBUM:
+        return None
+    return container
+
+
+def album_release_order(album: Album) -> tuple[bool, int, str, str]:
+    """
+    Return the sort key for release order: oldest first, albums without a year last.
+
+    :param album: The album to sort.
+    """
+    return (
+        not album.year,
+        album.year or 0,
+        album.name.casefold(),
+        (album.version or "").casefold(),
+    )
+
+
+def order_albums(albums: list[Album], order: ArtistOrder) -> list[Album]:
+    """
+    Return the albums in the artist order: by release for the release order, else shuffled.
+
+    :param albums: The albums to order.
+    :param order: The artist order.
+    """
+    if order is ArtistOrder.ALBUMS_BY_RELEASE:
+        return sorted(albums, key=album_release_order)
+    return random.sample(albums, len(albums))
+
+
+def get_current_playback_speed(queue: PlayerQueue) -> float:
+    """Return the playback_speed of the queue's current item (1.0 if unset)."""
+    if queue.current_item is None:
+        return 1.0
+    return float(queue.current_item.extra_attributes.get("playback_speed") or 1.0)
+
+
+def get_sleep_timer_stop_position(
+    mode: SleepTimerMode, queue_item: QueueItem, elapsed_time: float
+) -> float | None:
+    """
+    Return the position in the queue item at which a sleep timer in the given mode stops it.
+
+    Returns None when the item has no known end. Outside of any chapter, END_OF_CHAPTER stops
+    at the end of the item.
+
+    :param mode: END_OF_ITEM or END_OF_CHAPTER.
+    :param queue_item: The queue item that is playing.
+    :param elapsed_time: The (media-time) position in the queue item.
+    """
+    if not queue_item.duration:
+        return None
+    item_end = float(queue_item.duration)
+    if mode != SleepTimerMode.END_OF_CHAPTER or queue_item.media_item is None:
+        return item_end
+    chapters = sorted(queue_item.media_item.metadata.chapters or [], key=lambda x: x.start)
+    # a seek takes whole seconds, so a seek to a chapter start lands up to a second before it
+    position = elapsed_time + 1
+    for index, chapter in enumerate(chapters):
+        if chapter.end is not None:
+            chapter_end = chapter.end
+        elif index + 1 < len(chapters):
+            chapter_end = chapters[index + 1].start
+        else:
+            chapter_end = item_end
+        if chapter.start <= position < chapter_end:
+            return chapter_end
+    return item_end
+
+
+def committed_index(queue: PlayerQueue) -> int | None:
+    """
+    Return the highest queue index the player owns, or None if it owns none.
+
+    It holds both the playing track and the one handed to it for the transition. Nothing at or
+    below this index can be reordered: the player keeps playing what it was given whatever the
+    queue says, and the buffered position does not follow items that move around it.
+
+    :param queue: The queue to resolve the index for.
+    """
+    if queue.current_index is None:
+        return queue.index_in_buffer
+    if queue.index_in_buffer is None:
+        return queue.current_index
+    # repeat wraps the buffered index back to the front while the last track plays
+    return max(queue.current_index, queue.index_in_buffer)
+
+
+def interleave_groups[ItemT](groups: list[list[ItemT]]) -> list[ItemT]:
+    """
+    Randomly interleave groups while preserving the item order within each group.
+
+    :param groups: The ordered item groups to spread across the result.
+    """
+    positioned: list[tuple[float, ItemT]] = []
+    for items in groups:
+        total = len(items)
+        for offset, item in enumerate(items):
+            positioned.append(((offset + random.random()) / total, item))  # noqa: S311 - shuffle order
+    positioned.sort(key=lambda entry: entry[0])
+    return [item for _, item in positioned]
+
+
+# how many bounded passes to make separating directly-adjacent same-artist items
+ARTIST_REPAIR_PASSES = 4
+# how far ahead to look for a non-clashing item to swap in (keeps moves local so any
+# existing even spread is preserved)
+ARTIST_SWAP_WINDOW = 6
+
+
+def space_by_artist(artist_sets: list[set[str]], *, preceding: set[str] | None = None) -> list[int]:
+    """
+    Return an index order that best-effort keeps same-artist entries from sitting adjacent.
+
+    :param artist_sets: The lowercased artist-name set for each item, in its current order.
+    :param preceding: Artist names of the item that will sit directly before the first entry (the
+        seam with the already-queued tail); the first entry is kept clear of it too. None ignores it.
+    """
+    count = len(artist_sets)
+    order = list(range(count))
+    sets = list(artist_sets)
+    for _ in range(ARTIST_REPAIR_PASSES):
+        changed = False
+        # index -1 represents the preceding (seam) item, so the first entry is kept clear of it too
+        for index in range(-1, count - 1):
+            current = preceding if index == -1 else sets[index]
+            if not current or not current & sets[index + 1]:
+                continue
+            for target in range(index + 2, min(index + 2 + ARTIST_SWAP_WINDOW, count)):
+                if not current & sets[target]:
+                    order[index + 1], order[target] = order[target], order[index + 1]
+                    sets[index + 1], sets[target] = sets[target], sets[index + 1]
+                    changed = True
+                    break
+        if not changed:
+            break
+    return order
+
+
+def _is_builtin_playlist(item: MediaItemType) -> bool:
+    """Return True if the item is a playlist Music Assistant keeps itself."""
+    return isinstance(item, Playlist) and (
+        item.provider == "builtin"
+        or any(mapping.provider_domain == "builtin" for mapping in item.provider_mappings)
+    )

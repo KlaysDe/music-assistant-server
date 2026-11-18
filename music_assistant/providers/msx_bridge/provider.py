@@ -1,0 +1,444 @@
+"""MSX Bridge Player Provider implementation."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import hmac
+import logging
+import secrets
+import time
+from typing import TYPE_CHECKING, Any, cast
+
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.enums import ConfigEntryType, MediaType
+from music_assistant_models.errors import MusicAssistantError
+
+from music_assistant.models.player_provider import PlayerProvider
+
+from .constants import (
+    CONF_GROUP_STREAM_MODE,
+    CONF_HTTP_PORT,
+    CONF_PLAYER_IDLE_TIMEOUT,
+    CONF_SHOW_STOP_NOTIFICATION,
+    DEFAULT_GROUP_STREAM_MODE,
+    DEFAULT_HTTP_PORT,
+    DEFAULT_PLAYER_IDLE_TIMEOUT,
+    DEFAULT_SHOW_STOP_NOTIFICATION,
+    GROUP_STREAM_MODE_INDEPENDENT,
+    GROUP_STREAM_MODE_REDIRECT,
+    MSX_PLAYER_ID_PREFIX,
+)
+from .http_server import MSXHTTPServer
+from .player import MSXPlayer
+
+__all__ = ["MSXBridgeProvider"]
+
+if TYPE_CHECKING:
+    from music_assistant_models.player import PlayerMedia
+
+logger = logging.getLogger(__name__)
+
+
+class MSXBridgeProvider(PlayerProvider):
+    """Player Provider that bridges Music Assistant to Smart TVs via MSX."""
+
+    http_server: MSXHTTPServer | None = None
+    group_stream_mode: str = DEFAULT_GROUP_STREAM_MODE
+    _player_last_activity: dict[str, float]
+    _pending_unregisters: dict[str, asyncio.Event]
+    # the player of each TV that connected, also one that is not attached (idle, or its
+    # player is disabled), to attach again when the TV is back or its player is enabled
+    _tvs: dict[str, MSXPlayer]
+    _stream_token_secret: bytes
+    _timeout_task: asyncio.Task[None] | None = None
+    _background_tasks: set[asyncio.Task[None]]  # fire-and-forget tasks (unregister, stream stop)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the provider."""
+        super().__init__(*args, **kwargs)
+        self._player_last_activity = {}
+        self._pending_unregisters = {}
+        self._tvs = {}
+        # one secret per provider instance; the per-player tokens derive from it
+        self._stream_token_secret = secrets.token_bytes(32)
+        self._background_tasks = set()
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return (
+            ConfigEntry(
+                key=CONF_HTTP_PORT,
+                type=ConfigEntryType.INTEGER,
+                required=True,
+                default_value=str(DEFAULT_HTTP_PORT),
+            ),
+            ConfigEntry(
+                key=CONF_PLAYER_IDLE_TIMEOUT,
+                type=ConfigEntryType.INTEGER,
+                required=False,
+                default_value=str(DEFAULT_PLAYER_IDLE_TIMEOUT),
+            ),
+            ConfigEntry(
+                key=CONF_SHOW_STOP_NOTIFICATION,
+                type=ConfigEntryType.BOOLEAN,
+                required=False,
+                default_value=DEFAULT_SHOW_STOP_NOTIFICATION,
+            ),
+            ConfigEntry(
+                key=CONF_GROUP_STREAM_MODE,
+                type=ConfigEntryType.STRING,
+                required=False,
+                default_value=DEFAULT_GROUP_STREAM_MODE,
+                advanced=True,
+                options=[
+                    ConfigValueOption(
+                        GROUP_STREAM_MODE_REDIRECT,
+                    ),
+                    ConfigValueOption(
+                        GROUP_STREAM_MODE_INDEPENDENT,
+                    ),
+                ],
+            ),
+        )
+
+    async def handle_async_init(self) -> None:
+        """Handle async initialization — start embedded HTTP server."""
+        raw_port = cast("int", self.config.get_value(CONF_HTTP_PORT, DEFAULT_HTTP_PORT))
+        port = max(1, min(65535, int(raw_port)))
+        self.group_stream_mode = self._load_stream_mode()
+        self.http_server = MSXHTTPServer(self, port)
+        await self.http_server.start()
+        self.logger.info(
+            "MSX Bridge provider initialized, HTTP server on port %s, group_stream_mode=%s",
+            port,
+            self.group_stream_mode,
+        )
+
+    async def loaded_in_mass(self) -> None:
+        """Start idle timeout task after provider is loaded."""
+        await super().loaded_in_mass()
+        self._timeout_task = self.mass.create_task(self._run_idle_timeout_loop())
+        self.logger.info("MSX Bridge provider loaded — players register on demand")
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Handle unload — stop timeout task and HTTP server."""
+        if self._timeout_task and not self._timeout_task.done():
+            self._timeout_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._timeout_task
+            self._timeout_task = None
+
+        # Cancel and await any in-flight unregister tasks before proceeding
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
+        if self.http_server:
+            await self.http_server.stop()
+        self._player_last_activity.clear()
+        self.logger.info("MSX Bridge provider unloaded")
+
+    async def discover_players(self) -> None:
+        """Register the TVs that were active lately and are not attached, such as a re-enabled one."""
+        for player_id, player in list(self._tvs.items()):
+            if (
+                player_id in self._player_last_activity
+                and self.get_protocol(player_id) is None
+                and self.mass.players.wants_protocol(player_id)
+            ):
+                await self.mass.players.register(player)
+
+    async def get_or_register_player(
+        self,
+        player_id: str,
+        display_name: str | None = None,
+        ip_address: str | None = None,
+        device_id: str | None = None,
+    ) -> MSXPlayer:
+        """
+        Return the MSX player for this TV, registering it if needed.
+
+        The player of a TV the user disabled is returned without registering it.
+        """
+        # Wait for any pending unregister to complete (race condition handling)
+        if pending_event := self._pending_unregisters.get(player_id):
+            self.logger.debug("Waiting for pending unregister of %s before registering", player_id)
+            await pending_event.wait()
+        existing = self.get_protocol(player_id)
+        if existing and isinstance(existing, MSXPlayer):
+            if ip_address and existing.device_info.ip_address != ip_address:
+                existing.device_info.ip_address = ip_address
+                # publishes the identity of the TV under its new address
+                await self.mass.players.register(existing)
+            self.on_player_activity(player_id)
+            return existing
+        if (player := self._tvs.get(player_id)) is None:
+            name = display_name or self.player_display_name(player_id)
+            player = MSXPlayer(
+                provider=self,
+                protocol_id=player_id,
+                name=name,
+                ip_address=ip_address,
+                device_id=device_id,
+            )
+            self._tvs[player_id] = player
+        elif ip_address:
+            player.device_info.ip_address = ip_address
+        self._player_last_activity[player_id] = time.monotonic()
+        if self.mass.players.wants_protocol(player_id):
+            player.mark_available()
+            await self.mass.players.register(player)
+            self.logger.info("Registered MSX player: %s (%s)", player.display_name, player_id)
+        return player
+
+    def get_player_id(self, player_id: str) -> str:
+        """
+        Return the id of the player a TV is attached to, for the player and queue commands.
+
+        Returns the given id while the TV is not attached.
+
+        :param player_id: The id of the TV.
+        """
+        if (player := self.get_protocol(player_id)) is not None and player.player is not None:
+            return player.player.player_id
+        return player_id
+
+    def on_player_activity(self, player_id: str) -> None:
+        """Record activity for a player (extends idle timeout)."""
+        # Monotonic: a wall-clock NTP step must not age players past the cutoff
+        self._player_last_activity[player_id] = time.monotonic()
+        player = self.get_protocol(player_id)
+        if isinstance(player, MSXPlayer):
+            player.mark_available()
+
+    def stop_tv(self, player_id: str) -> None:
+        """Stop playback on the TV by broadcasting stop and cancelling its streams."""
+        if self.http_server:
+            self.http_server.broadcast_stop(player_id)
+            self.http_server.cancel_streams_for_player(player_id)
+
+    def forget_player(self, player_id: str) -> None:
+        """Stop the TV of a removed player; it may attach again when the TV reconnects."""
+        # Called when user chooses to remove the player from MA.
+        # It will reappear if the TV reconnects.
+        self.stop_tv(player_id)
+        self._player_last_activity.pop(player_id, None)
+        self._tvs.pop(player_id, None)
+        self.logger.info("Player %s removed by user", player_id)
+
+    def notify_native_track_started(self, player_id: str) -> None:
+        """Reset the TV clock for a new item without reloading its native playlist."""
+        if self.http_server:
+            self.http_server.broadcast_clock_reset(player_id)
+
+    def notify_play_started(
+        self,
+        player_id: str,
+        *,
+        title: str | None = None,
+        artist: str | None = None,
+        image_url: str | None = None,
+        duration: int | None = None,
+        next_action: str | None = None,
+        prev_action: str | None = None,
+    ) -> None:
+        """Notify WebSocket clients that playback started (for MA -> MSX push)."""
+        if self.http_server:
+            self.http_server.broadcast_play(
+                player_id,
+                title=title,
+                artist=artist,
+                image_url=image_url,
+                duration=duration,
+                next_action=next_action,
+                prev_action=prev_action,
+            )
+
+    def notify_play_playlist(
+        self,
+        player_id: str,
+        start_index: int = 0,
+        queue_id: str | None = None,
+    ) -> None:
+        """Notify WebSocket clients to play an MSX native playlist from the MA queue."""
+        if self.http_server:
+            qid = queue_id or player_id
+            url = f"/msx/queue-playlist/{player_id}.json?start={start_index}&queue_id={qid}"
+            self.http_server.broadcast_playlist(player_id, url)
+
+    def notify_play_paused(self, player_id: str) -> None:
+        """Notify WebSocket clients that playback is paused (MA pause -> MSX)."""
+        if self.http_server:
+            self.http_server.broadcast_pause(player_id)
+
+    def notify_play_resumed(self, player_id: str) -> None:
+        """Notify WebSocket clients that playback resumed (MA resume -> MSX)."""
+        if self.http_server:
+            self.http_server.broadcast_resume(player_id)
+
+    def notify_play_stopped(self, player_id: str) -> None:
+        """Notify the MSX player that playback has stopped."""
+        # Sends broadcast_stop + cancel_streams twice — same as Disable flow, which
+        # stops playback on MSX instantly (vs single signal with ~30s delay).
+        server = self.http_server
+        if not server:
+            return
+
+        def _send() -> None:
+            server.broadcast_stop(player_id)
+            server.cancel_streams_for_player(player_id)
+
+        _send()
+        _send()
+
+    def notify_seek(self, player_id: str, position_seconds: int) -> None:
+        """Notify WebSocket clients to seek to position (MA seek -> MSX)."""
+        if self.http_server:
+            self.http_server.broadcast_seek(player_id, position_seconds)
+
+    def notify_volume(self, player_id: str, volume_level: int) -> None:
+        """Notify the TV of a volume change requested through MA."""
+        if self.http_server:
+            self.http_server.broadcast_volume(player_id, volume_level)
+
+    def is_redirect_stream_mode(self) -> bool:
+        """Return whether direct MA Streamserver delivery is enabled."""
+        # In redirect mode the TV is 302-redirected to the MA Streamserver
+        # (``resolve_stream_url``) instead of being served by the local
+        # proxy/ffmpeg pipeline. See also ``get_ma_stream_url()``.
+        return self.group_stream_mode == GROUP_STREAM_MODE_REDIRECT
+
+    def get_stream_token(self, player_id: str) -> str:
+        """
+        Return the token that authorizes audio requests for the given player.
+
+        :param player_id: The player to build an audio URL for.
+        """
+        # Derived rather than stored, so a caller cannot grow provider state by asking for
+        # tokens under new player ids. It stays the same for the provider's lifetime: an
+        # idle TV is detached after the configured timeout, and changing the token there
+        # would strand the URLs a long-running TV session has already cached.
+        digest = hmac.new(self._stream_token_secret, player_id.encode(), hashlib.sha256)
+        return digest.hexdigest()[:32]
+
+    async def get_ma_stream_url(self, player_id: str, media: PlayerMedia) -> str | None:
+        """
+        Resolve the direct MA Streamserver URL for the given media.
+
+        :param player_id: The MSX player requesting the stream.
+        :param media: PlayerMedia to resolve the stream URL for.
+        :return: Direct stream URL, or None if resolution fails.
+        """
+        # Used by redirect stream mode: the TV fetches audio straight from the
+        # MA Streamserver, which applies the player's own codec config and DSP —
+        # no local proxy/ffmpeg involved.
+        try:
+            stream_url: str = await self.mass.streams.resolve_stream_url(player_id, media)
+        except MusicAssistantError as err:
+            logger.warning("[MARedirect] Failed to resolve MA stream URL: %s", err, exc_info=True)
+            return None
+        # MA returns a flow URL (continuous whole-queue stream) when e.g. crossfade
+        # is enabled and the player lacks gapless support. That breaks the MSX
+        # per-track model (progress display, auto-advance re-enqueue), so serve
+        # such tracks through the local per-track proxy instead.
+        if "/flow/" in stream_url and media.media_type != MediaType.FLOW_STREAM:
+            logger.debug(
+                "[MARedirect] Flow-mode URL not usable for MSX per-track playback, "
+                "falling back to proxy: %s",
+                stream_url,
+            )
+            return None
+        logger.debug("[MARedirect] Resolved MA stream URL: %s", stream_url)
+        return stream_url
+
+    def player_display_name(
+        self, player_id: str, prefix_label: str = "MSX TV", remote_ip: str | None = None
+    ) -> str:
+        """Build a unique display name from player_id for the MA UI."""
+        prefix = MSX_PLAYER_ID_PREFIX
+        suffix = player_id.removeprefix(prefix)
+        if not suffix:
+            return prefix_label
+        # IP-based: msx_192_168_10_15 → "MSX TV (192.168.10.15)"
+        if "_" in suffix:
+            parts = suffix.split("_")
+            if all(p.isdigit() for p in parts):
+                return f"{prefix_label} ({'.'.join(parts)})"
+        # UUID-based: msx_msx_bc93ce1d_491d_4d95_9430_2fbeabb5ce1b → "MSX TV (bc93)"
+        # Show only first 4 chars of UUID for readability, plus IP if available
+        if suffix.startswith("msx_") and len(suffix) > 12:
+            uuid_part = suffix[4:8]  # First 4 chars after "msx_"
+            if remote_ip:
+                return f"{prefix_label} ({uuid_part}) [{remote_ip}]"
+            return f"{prefix_label} ({uuid_part})"
+        # Fallback: truncate long suffixes
+        if len(suffix) > 12:
+            if remote_ip:
+                return f"{prefix_label} ({suffix[:8]}...) [{remote_ip}]"
+            return f"{prefix_label} ({suffix[:8]}...)"
+        if remote_ip:
+            return f"{prefix_label} ({suffix}) [{remote_ip}]"
+        return f"{prefix_label} ({suffix})"
+
+    def _load_stream_mode(self) -> str:
+        """Return the configured stream mode, falling back to redirect for unknown values."""
+        raw_mode = self.config.get_value(CONF_GROUP_STREAM_MODE, DEFAULT_GROUP_STREAM_MODE)
+        if raw_mode not in (GROUP_STREAM_MODE_REDIRECT, GROUP_STREAM_MODE_INDEPENDENT):
+            self.logger.warning("Unknown stream delivery mode %r; using redirect", raw_mode)
+            return DEFAULT_GROUP_STREAM_MODE
+        return raw_mode
+
+    async def _handle_player_unregister(self, player_id: str) -> None:
+        """Unregister a player with race-condition handling."""
+        self.logger.debug("Unregistering MSX player %s", player_id)
+        unregister_event = asyncio.Event()
+        self._pending_unregisters[player_id] = unregister_event
+        try:
+            await self.mass.players.unregister(player_id)
+        finally:
+            self._pending_unregisters.pop(player_id, None)
+            self._player_last_activity.pop(player_id, None)
+            unregister_event.set()
+
+    async def _run_idle_timeout_loop(self) -> None:
+        """Background task: unregister players idle longer than configured timeout."""
+        timeout_minutes = max(
+            1,
+            min(
+                1440,
+                int(
+                    cast(
+                        "int",
+                        self.config.get_value(
+                            CONF_PLAYER_IDLE_TIMEOUT, DEFAULT_PLAYER_IDLE_TIMEOUT
+                        ),
+                    )
+                ),
+            ),
+        )
+        interval_seconds = 60
+        while not self.mass.closing:
+            try:
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                break
+            now = time.monotonic()
+            cutoff = now - (timeout_minutes * 60)
+            for player in list(self.protocols):
+                if not isinstance(player, MSXPlayer):
+                    continue
+                last = self._player_last_activity.get(player.protocol_id, 0)
+                if last > 0 and last < cutoff:
+                    self.logger.info(
+                        "Unregistering idle MSX player %s (no activity for %d min)",
+                        player.protocol_id,
+                        timeout_minutes,
+                    )
+                    task = self.mass.create_task(self._handle_player_unregister(player.protocol_id))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)

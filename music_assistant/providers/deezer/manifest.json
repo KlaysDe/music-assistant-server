@@ -1,0 +1,14 @@
+{
+  "type": "music",
+  "domain": "deezer",
+  "stage": "stable",
+  "name": "Deezer",
+  "description": "Stream Deezer’s full music catalogue in FLAC audio, up to 24-bit hi-res.",
+  "codeowners": ["@jdaberkow"],
+  "credits": [
+    "[deezer-python-gql](https://github.com/music-assistant/deezer-python-gql)"
+  ],
+  "documentation": "https://music-assistant.io/music-providers/deezer/",
+  "requirements": ["deezer-python-gql==0.23.0", "pycryptodome==3.24.0"],
+  "multi_instance": true
+}

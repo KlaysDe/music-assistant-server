@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Music Assistant MSX Plugin</title>
+    <script src="/msx/tvx-plugin-module.min.js"></script>
+    <script src="/msx/bridge.js?v=22"></script>
+</head>
+<body>
+<script>
+tvx.PluginTools.onReady(function() {
+    tvx.InteractionPlugin.setupHandler(new window.MSXBridgeHandler());
+    tvx.InteractionPlugin.init();
+});
+</script>
+</body>
+</html>

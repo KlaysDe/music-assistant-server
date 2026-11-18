@@ -1,0 +1,45 @@
+{
+  "config_entries": {
+    "quality": {
+      "label": "Stream Quality",
+      "description": "Maximum streaming quality. Lower quality will be used if selected quality is unavailable.",
+      "options": {
+        "27": "Hi-Res 192kHz/24 bit",
+        "7": "Hi-Res 96kHz/24 bit",
+        "6": "CD Quality 44.1kHz/16 bit",
+        "5": "MP3 320kbps"
+      }
+    }
+  },
+  "media": {
+    "recommendations": {
+      "favorite_artist_releases": {
+        "name": "New From Your Artists"
+      },
+      "new_releases": {
+        "name": "New Releases"
+      },
+      "best_sellers": {
+        "name": "Best Sellers"
+      },
+      "most_streamed": {
+        "name": "Most Streamed"
+      },
+      "press_awards": {
+        "name": "Press Awards"
+      },
+      "editor_picks": {
+        "name": "Editor's Picks"
+      },
+      "ideal_discography": {
+        "name": "Ideal Discography"
+      }
+    }
+  },
+  "manifest": {
+    "description": "Stream high-resolution music from Qobuz’s catalogue — ideal for audiophiles."
+  },
+  "errors": {
+    "create_playlist_failed": "Failed to create playlist: {0}"
+  }
+}

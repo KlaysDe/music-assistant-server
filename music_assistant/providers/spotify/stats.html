@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Spotify request stats</title>
+  <style nonce="__STATS_NONCE__">
+    :root {
+      color-scheme: light;
+      /* Match the Music Assistant settings surfaces in the enclosing dialog. */
+      --page: #f5f5f5;
+      --panel: #ffffff;
+      --panel-soft: #e7e7e7;
+      --ink: #000000;
+      --muted: #666666;
+      --line: #d4d4d4;
+      --focus: #0277bd;
+      --series-dev: #0277bd;
+      --success: #2e7d32;
+      --error: #b32626;
+      --success-soft: color-mix(in srgb, var(--success) 12%, var(--panel));
+      --radius: 10px;
+      font: 14px/1.5 Roboto, Arial, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --page: #181818; --panel: #232323; --panel-soft: #2d2d2d;
+        --ink: #ffffff; --muted: #a0a0a0; --line: #3d3d3d;
+        --focus: #03a9f4; --series-dev: #03a9f4;
+        --success: #66bb6a; --error: #ff8181;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--page); color: var(--ink); }
+    button, select { color: inherit; font: inherit; }
+    .shell { width: min(1180px, 100%); margin: 0 auto; padding: 24px 24px 32px; }
+    header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+    h1 { margin: 0; font-size: 20px; line-height: 1.3; }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .window-control { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--muted); }
+    select { border: 0; background: var(--panel); color: var(--ink); font-weight: 500; cursor: pointer; }
+    select option { background: var(--panel); color: var(--ink); }
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .refresh-note { min-width: 92px; color: var(--muted); font-size: 12px; text-align: right; }
+    .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .status.live::before { background: var(--success); }
+    .status.error::before { background: var(--error); }
+    .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 16px; }
+    .card, .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+    .card { padding: 14px 16px; }
+    .card-label { color: var(--muted); font-size: 12px; font-weight: 500; }
+    .card-value { margin-top: 4px; font-size: 24px; line-height: 1.3; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .card-foot { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .panel { overflow: hidden; margin-top: 16px; }
+    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px 14px; }
+    h2 { margin: 0; font-size: 16px; }
+    .panel-desc { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--series-dev); }
+    .dot.music { background: var(--success); }
+    .chart-wrap { position: relative; min-height: 250px; padding: 0 12px 8px; }
+    .chart { display: block; width: 100%; height: 245px; overflow: visible; }
+    .chart text { fill: var(--muted); font-size: 10px; }
+    .gridline { stroke: var(--line); stroke-width: 1; }
+    .line-dev, .line-ma { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+    .line-dev { stroke: var(--series-dev); }
+    .line-ma { stroke: var(--success); }
+    .area-dev { fill: var(--series-dev); opacity: .08; }
+    .area-ma { fill: var(--success); opacity: .08; }
+    .empty-chart { position: absolute; inset: 36px 20px 40px; display: grid; place-items: center; color: var(--muted); text-align: center; pointer-events: none; }
+    .empty-chart[hidden] { display: none; }
+    .token-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+    .token { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 16px 18px; }
+    .token-name { display: flex; align-items: center; gap: 10px; min-width: 0; font-weight: 650; }
+    .token-meta { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .badge { padding: 3px 8px; border-radius: 999px; background: var(--panel-soft); color: var(--muted); font-size: 11px; font-weight: 650; }
+    .badge.on { background: var(--success-soft); color: var(--success); }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: right; font-variant-numeric: tabular-nums; }
+    th, td { padding: 11px 16px; border-top: 1px solid var(--line); white-space: nowrap; }
+    th { background: var(--panel-soft); color: var(--ink); font-size: 12px; font-weight: 500; }
+    th:first-child, td:first-child { padding-left: 20px; text-align: left; }
+    th:last-child, td:last-child { padding-right: 20px; }
+    td { font-size: 12px; }
+    .endpoint { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+    .zero { color: var(--muted); }
+    .table-empty { padding: 30px 20px; color: var(--muted); text-align: center; }
+    .footnote { margin: 14px 2px 0; color: var(--muted); font-size: 11px; }
+    .error-box { display: none; margin: 0 0 16px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--error) 35%, var(--line)); border-radius: var(--radius); background: color-mix(in srgb, var(--error) 8%, var(--panel)); color: var(--error); }
+    .error-box.show { display: block; }
+    @media (max-width: 760px) {
+      .shell { padding: 16px 16px 24px; }
+      header { align-items: flex-start; flex-direction: column; gap: 14px; }
+      .controls { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .card { padding: 12px; }
+      .card-value { font-size: 22px; }
+      .token-grid { grid-template-columns: 1fr; gap: 10px; }
+      .panel-head { padding: 16px; flex-direction: column; }
+      .legend { gap: 10px; }
+    }
+    @media (max-width: 390px) { .token { align-items: flex-start; flex-direction: column; gap: 8px; } .token-meta { padding-left: 18px; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <h1>Spotify request stats</h1>
+      <div class="controls">
+        <label class="window-control">Endpoint
+          <select id="endpoint-filter" aria-label="Filter endpoint"><option value="*">All endpoints</option></select>
+        </label>
+        <label class="window-control">Plot
+          <select id="metric" aria-label="Chart metric">
+            <option value="requests">Requests</option>
+            <option value="rate_limited">HTTP 429</option>
+            <option value="paced">Locally paced</option>
+          </select>
+        </label>
+        <label class="window-control">Window
+          <select id="window" aria-label="Time window">
+            <option value="15">Last 15 minutes</option>
+            <option value="60">Last hour</option>
+            <option value="360">Last 6 hours</option>
+            <option value="1440">Last 24 hours</option>
+          </select>
+        </label>
+        <div class="refresh-note"><span id="status" class="status">Connecting</span><br><span id="updated">—</span></div>
+      </div>
+    </header>
+    <div id="error" class="error-box" role="status"></div>
+    <section class="cards" aria-label="Summary">
+      <article class="card"><div class="card-label">Requests</div><div class="card-value" id="total-requests">—</div><div class="card-foot" id="window-label">Selected window</div></article>
+      <article class="card"><div class="card-label">Rate limited</div><div class="card-value" id="total-limited">—</div><div class="card-foot">Upstream HTTP 429 responses</div></article>
+      <article class="card"><div class="card-label">Locally paced</div><div class="card-value" id="total-paced">—</div><div class="card-foot">Requests held by local pacing</div></article>
+      <article class="card"><div class="card-label">Average response</div><div class="card-value" id="avg-response">—</div><div class="card-foot">Across recorded requests</div></article>
+    </section>
+    <section class="panel" aria-labelledby="traffic-heading">
+      <div class="panel-head">
+        <div><h2 id="traffic-heading">Request activity over time</h2><p class="panel-desc">Selected metric per UTC bucket, split by token</p></div>
+        <div class="legend" aria-label="Chart legend"><span><i class="dot"></i>Developer token</span><span><i class="dot music"></i>Music Assistant</span></div>
+      </div>
+      <div class="chart-wrap"><svg id="chart" class="chart" role="img" aria-label="Request counts over time"></svg><div id="chart-empty" class="empty-chart">Waiting for activity in this window</div></div>
+    </section>
+    <section class="token-grid" aria-label="Token status">
+      <article class="panel token"><div class="token-name"><i class="dot"></i>Developer token</div><div class="token-meta"><span id="dev-status" class="badge">—</span><span id="dev-limits">0 rate limited</span><span id="dev-cooldown">No cooldown</span></div></article>
+      <article class="panel token"><div class="token-name"><i class="dot music"></i>Music Assistant</div><div class="token-meta"><span id="ma-status" class="badge">—</span><span id="ma-limits">0 rate limited</span><span id="ma-cooldown">No cooldown</span></div></article>
+    </section>
+    <section class="panel" aria-labelledby="endpoint-heading">
+      <div class="panel-head"><div><h2 id="endpoint-heading">Endpoint breakdown</h2><p class="panel-desc">Counts grouped by endpoint and token</p></div></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Dev requests</th><th>Dev 429</th><th>MA requests</th><th>MA 429</th><th>Paced</th><th>Errors</th><th>Wait</th><th>Avg response</th><th>Max retry-after</th></tr></thead>
+          <tbody id="endpoint-rows"><tr><td colspan="10" class="table-empty">No endpoint activity recorded</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <p class="footnote">Counts include retries. Local wait measures time at Music Assistant’s request gate. History is kept in memory. <span id="history-start"></span></p>
+  </main>
+  <script nonce="__STATS_NONCE__">
+    (() => {
+      const grant = location.hash.slice(1);
+      history.replaceState(null, "", location.pathname + location.search);
+      const endpoint = new URL("data", location.href);
+      const colors = { "developer-token": "dev", "music-assistant": "ma" };
+      const $ = (id) => document.getElementById(id);
+      const preferenceKey = (id) => `music-assistant.spotify-stats.${id}`;
+      const readPreference = (id) => {
+        try { return localStorage.getItem(preferenceKey(id)); } catch { return null; }
+      };
+      const savePreference = (id) => {
+        try { localStorage.setItem(preferenceKey(id), $(id).value); } catch { /* Storage is optional. */ }
+      };
+      for (const id of ["window", "metric"]) {
+        const saved = readPreference(id);
+        if ([...$(id).options].some((option) => option.value === saved)) $(id).value = saved;
+      }
+      let preferredEndpoint = readPreference("endpoint-filter") || "*";
+      const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+      const fmt = (value) => number(value).toLocaleString();
+      const duration = (seconds) => {
+        const n = Math.max(0, Math.ceil(number(seconds)));
+        return n < 60 ? `${n}s` : `${Math.floor(n / 60)}m ${n % 60}s`;
+      };
+      const timeLabel = (epoch, options) => new Date(number(epoch) * 1000).toLocaleTimeString([], options);
+      let stopped = false;
+      let timer;
+      let windowRows = [];
+      let latestData = null;
+      let activeRequest = null;
+      let requestSequence = 0;
+
+      function setStatus(text, kind = "") {
+        const el = $("status");
+        el.textContent = text;
+        el.className = `status ${kind}`.trim();
+      }
+
+      function renderTokens(tokens = {}) {
+        for (const [key, prefix] of [["developer-token", "dev"], ["music-assistant", "ma"]]) {
+          const token = tokens[key] || {};
+          const limited = windowRows.filter((row) => row.token === key).reduce((sum, row) => sum + number(row.rate_limited), 0);
+          const badge = $(`${prefix}-status`);
+          const active = Boolean(token.active);
+          badge.textContent = active ? "Active" : "Inactive";
+          badge.className = `badge${active ? " on" : ""}`;
+          const cooldown = number(token.cooldown_seconds);
+          $(`${prefix}-limits`).textContent = `${fmt(limited)} rate limited`;
+          $(`${prefix}-cooldown`).textContent = cooldown > 0 ? `Cooldown ${duration(cooldown)}` : "No cooldown";
+        }
+      }
+
+      function drawChart(rows, data, endpointFilter, metric) {
+        const svg = $("chart");
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        const bucketSeconds = Math.max(1, number(data.bucket_seconds));
+        const now = Math.floor(Date.now() / 1000);
+        const observedAt = number(data.observed_at) || now;
+        const windowStart = number(data.window_start) || observedAt - Number($("window").value) * 60;
+        const firstBucket = Math.floor(windowStart / bucketSeconds) * bucketSeconds;
+        const lastBucket = Math.floor(observedAt / bucketSeconds) * bucketSeconds;
+        const buckets = new Map();
+        for (let timestamp = firstBucket; timestamp <= lastBucket; timestamp += bucketSeconds) {
+          buckets.set(timestamp, { "developer-token": 0, "music-assistant": 0 });
+        }
+        for (const row of rows) {
+          if (endpointFilter !== "*" && row.endpoint !== endpointFilter) continue;
+          const t = number(row.time);
+          if (!buckets.has(t)) continue;
+          if (Object.hasOwn(buckets.get(t), row.token)) buckets.get(t)[row.token] += number(row[metric]);
+        }
+        const entries = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
+        $("chart-empty").textContent = metric === "requests" ? "No requests recorded for this endpoint and window" : metric === "rate_limited" ? "No HTTP 429 responses for this endpoint and window" : "No locally paced requests for this endpoint and window";
+        $("chart-empty").hidden = entries.some(([, value]) => value["developer-token"] + value["music-assistant"] > 0);
+        const metricNames = { requests: "requests", rate_limited: "HTTP 429 responses", paced: "locally paced requests" };
+        $("chart").setAttribute("aria-label", `${metricNames[metric]} over time for ${endpointFilter === "*" ? "all endpoints" : endpointFilter}`);
+        if (!entries.length) return;
+        const ns = "http://www.w3.org/2000/svg";
+        const width = Math.max(320, svg.clientWidth || 760), height = 245;
+        const pad = { left: 40, right: 12, top: 12, bottom: 32 };
+        const plotW = width - pad.left - pad.right, plotH = height - pad.top - pad.bottom;
+        const max = Math.max(1, ...entries.map(([, v]) => v["developer-token"] + v["music-assistant"]));
+        const scale = Math.pow(10, Math.floor(Math.log10(max)));
+        const ceiling = Math.ceil(max / scale) * scale;
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.setAttribute("preserveAspectRatio", "none");
+        const add = (tag, attrs, parent = svg) => {
+          const el = document.createElementNS(ns, tag);
+          for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, String(value));
+          parent.appendChild(el); return el;
+        };
+        const x = (i) => pad.left + (entries.length === 1 ? plotW / 2 : i * plotW / (entries.length - 1));
+        const y = (n) => pad.top + plotH - n / ceiling * plotH;
+        for (let i = 0; i <= 4; i++) {
+          const val = ceiling * i / 4, yy = y(val);
+          add("line", { x1: pad.left, x2: width - pad.right, y1: yy, y2: yy, class: "gridline" });
+          const text = add("text", { x: pad.left - 7, y: yy + 3, "text-anchor": "end" });
+          text.textContent = fmt(val);
+        }
+        const step = Math.max(1, Math.ceil(entries.length / 5));
+        entries.forEach(([epoch], i) => {
+          if (i % step === 0 || i === entries.length - 1) {
+            const text = add("text", { x: x(i), y: height - 8, "text-anchor": "middle" });
+            text.textContent = timeLabel(epoch, { hour: "numeric", minute: "2-digit" });
+          }
+        });
+        for (const token of ["developer-token", "music-assistant"]) {
+          const points = entries.map(([epoch, value], i) => [x(i), y(value[token])]);
+          const d = points.map(([px, py], i) => `${i ? "L" : "M"}${px},${py}`).join(" ");
+          if (points.length > 1) add("path", { d: `${d} L${points.at(-1)[0]},${y(0)} L${points[0][0]},${y(0)} Z`, class: `area-${colors[token]}` });
+          add("path", { d, class: `line-${colors[token]}` });
+          if (points.length === 1) add("circle", { cx: points[0][0], cy: points[0][1], r: 3.5, fill: token === "developer-token" ? "var(--blue)" : "var(--accent)" });
+        }
+      }
+
+      function renderTable(rows) {
+        const groups = new Map();
+        for (const row of rows) {
+          const name = String(row.endpoint || "Unknown endpoint");
+          if (!groups.has(name)) groups.set(name, { "developer-token": { requests: 0, rate_limited: 0 }, "music-assistant": { requests: 0, rate_limited: 0 }, paced: 0, errors: 0, wait_ms: 0, response_total: 0, response_count: 0, max_retry_after: 0 });
+          const group = groups.get(name), token = group[row.token];
+          if (token) { token.requests += number(row.requests); token.rate_limited += number(row.rate_limited); }
+          for (const key of ["paced", "errors", "wait_ms"]) group[key] += number(row[key]);
+          group.response_total += number(row.response_ms);
+          group.response_count += number(row.requests);
+          group.max_retry_after = Math.max(group.max_retry_after, number(row.max_retry_after));
+        }
+        const body = $("endpoint-rows");
+        while (body.firstChild) body.removeChild(body.firstChild);
+        const sorted = [...groups.entries()].sort((a, b) => b[1]["developer-token"].requests + b[1]["music-assistant"].requests - a[1]["developer-token"].requests - a[1]["music-assistant"].requests);
+        if (!sorted.length) {
+          const tr = document.createElement("tr"), td = document.createElement("td");
+          td.colSpan = 10; td.className = "table-empty"; td.textContent = "No endpoint activity recorded"; tr.appendChild(td); body.appendChild(tr); return;
+        }
+        for (const [name, value] of sorted) {
+          const tr = document.createElement("tr");
+          const cells = [name, fmt(value["developer-token"].requests), fmt(value["developer-token"].rate_limited), fmt(value["music-assistant"].requests), fmt(value["music-assistant"].rate_limited), fmt(value.paced), fmt(value.errors), `${(value.wait_ms / 1000).toLocaleString([], { maximumFractionDigits: 1 })}s`, value.response_count ? `${fmt(Math.round(value.response_total / value.response_count))}ms` : "—", value.max_retry_after ? `${fmt(value.max_retry_after)}s` : "—"];
+          cells.forEach((content, index) => {
+            const td = document.createElement("td");
+            td.textContent = content;
+            if (index === 0) td.className = "endpoint";
+            if (index > 0 && index < 6 && Number(content.replaceAll(",", "")) === 0) td.classList.add("zero");
+            tr.appendChild(td);
+          });
+          body.appendChild(tr);
+        }
+      }
+
+      function updateEndpointOptions(rows) {
+        const select = $("endpoint-filter");
+        const endpoints = [...new Set(rows.map((row) => String(row.endpoint || "Unknown endpoint")))].sort();
+        while (select.options.length > 1) select.remove(1);
+        for (const name of endpoints) {
+          const option = document.createElement("option");
+          option.value = name; option.textContent = name; select.appendChild(option);
+        }
+        select.value = endpoints.includes(preferredEndpoint) ? preferredEndpoint : "*";
+      }
+
+      function render(data) {
+        latestData = data;
+        const allRows = Array.isArray(data.rows) ? data.rows : [];
+        updateEndpointOptions(allRows);
+        const selectedEndpoint = $("endpoint-filter").value;
+        const rows = selectedEndpoint === "*" ? allRows : allRows.filter((row) => row.endpoint === selectedEndpoint);
+        let requests = 0, limited = 0, paced = 0, responseTotal = 0, responseCount = 0;
+        for (const row of rows) {
+          requests += number(row.requests); limited += number(row.rate_limited); paced += number(row.paced);
+          responseTotal += number(row.response_ms); responseCount += number(row.requests);
+        }
+        $("total-requests").textContent = fmt(requests);
+        $("total-limited").textContent = fmt(limited);
+        $("total-paced").textContent = fmt(paced);
+        $("avg-response").textContent = responseCount ? `${fmt(Math.round(responseTotal / responseCount))} ms` : "—";
+        const windowMinutes = Number($("window").value);
+        $("window-label").textContent = `Last ${windowMinutes >= 60 ? `${windowMinutes / 60} ${windowMinutes === 60 ? "hour" : "hours"}` : `${windowMinutes} minutes`}`;
+        windowRows = rows;
+        renderTokens(data.tokens || {});
+        drawChart(allRows, data, selectedEndpoint, $("metric").value);
+        renderTable(rows);
+        $("updated").textContent = `Updated ${timeLabel(data.observed_at, { hour: "numeric", minute: "2-digit", second: "2-digit" })}`;
+        const started = number(data.started_at);
+        $("history-start").textContent = started ? `Collecting since ${new Date(started * 1000).toLocaleString()}.` : "";
+      }
+
+      function scheduleRefresh() {
+        clearTimeout(timer);
+        if (!stopped) timer = setTimeout(() => refresh(), 15000);
+      }
+
+      async function refresh(force = false) {
+        if (stopped || document.visibilityState !== "visible") return;
+        if (activeRequest) {
+          if (!force) return;
+          activeRequest.abort();
+        }
+        const controller = new AbortController();
+        activeRequest = controller;
+        const sequence = ++requestSequence;
+        const requestedWindow = Number($("window").value);
+        setStatus("Loading");
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${grant}` },
+            body: JSON.stringify({ window_minutes: requestedWindow }),
+            cache: "no-store",
+            redirect: "error",
+            signal: controller.signal
+          });
+          if (response.status === 401 || response.status === 403) {
+            if (sequence !== requestSequence) return;
+            stopped = true; clearTimeout(timer); setStatus("Access expired", "error");
+            $("error").textContent = "This statistics link has expired or is no longer valid. Reopen it from Music Assistant settings.";
+            $("error").classList.add("show"); return;
+          }
+          if (!response.ok) throw new Error(`Request failed (${response.status})`);
+          const data = await response.json();
+          if (sequence !== requestSequence || requestedWindow !== Number($("window").value)) return;
+          render(data); $("error").classList.remove("show"); setStatus("Live", "live");
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          if (sequence !== requestSequence) return;
+          setStatus("Retrying", "error");
+          $("error").textContent = `Statistics could not be loaded: ${error instanceof Error ? error.message : "request failed"}. Retrying in 15 seconds.`;
+          $("error").classList.add("show");
+        } finally {
+          if (activeRequest === controller) {
+            activeRequest = null;
+            scheduleRefresh();
+          }
+        }
+      }
+
+      $("window").addEventListener("change", () => {
+        savePreference("window");
+        clearTimeout(timer);
+        refresh(true);
+      });
+      $("endpoint-filter").addEventListener("change", () => {
+        preferredEndpoint = $("endpoint-filter").value;
+        savePreference("endpoint-filter");
+        if (latestData) render(latestData);
+      });
+      $("metric").addEventListener("change", () => {
+        savePreference("metric");
+        if (latestData) render(latestData);
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          clearTimeout(timer);
+          if (activeRequest) {
+            requestSequence++;
+            activeRequest.abort();
+            activeRequest = null;
+          }
+        } else if (!stopped) {
+          clearTimeout(timer);
+          refresh(true);
+        }
+      });
+      window.addEventListener("resize", () => {
+        if (latestData) drawChart(Array.isArray(latestData.rows) ? latestData.rows : [], latestData, $("endpoint-filter").value, $("metric").value);
+      });
+      if (!grant) {
+        stopped = true; setStatus("No access", "error");
+        $("error").textContent = "Open this page from Music Assistant settings to receive a temporary access grant.";
+        $("error").classList.add("show");
+      } else {
+        refresh();
+      }
+    })();
+  </script>
+</body>
+</html>

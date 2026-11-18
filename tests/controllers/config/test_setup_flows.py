@@ -1,0 +1,2847 @@
+"""Tests for the setup flow engine (SetupFlowMixin + SetupSession)."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import replace
+from functools import partial
+from pathlib import Path
+from types import MethodType, SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+from aiohttp.test_utils import make_mocked_request
+from music_assistant_models.auth import Scope, User, UserRole
+from music_assistant_models.config_entries import (
+    ConfigEntry,
+    ConfigValueType,
+    ProviderAccess,
+)
+from music_assistant_models.enums import (
+    ConfigEntryType,
+    EventType,
+    FlowStepType,
+    PlayerType,
+    ProtocolRole,
+    ProviderFeature,
+    ProviderSharing,
+    ProviderStage,
+    ProviderType,
+)
+from music_assistant_models.errors import (
+    ActionUnavailable,
+    InsufficientPermissions,
+    LoginFailed,
+    SetupFailedError,
+)
+from music_assistant_models.provider import ProviderManifest
+from music_assistant_models.translations import TRANSLATION_RESOLVER
+
+from music_assistant.constants import CONF_PLAYERS, CONF_PROVIDERS, ENCRYPT_SUFFIX
+from music_assistant.controllers.config.flows import SetupFlowAccess
+from music_assistant.controllers.music import MusicController
+from music_assistant.controllers.music.constants import CONF_BOUND_ACCOUNT_ID
+from music_assistant.controllers.storage import StorageController
+from music_assistant.controllers.translations import TranslationController
+from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
+from music_assistant.mass import MusicAssistant
+from music_assistant.models.music_provider import MusicProvider
+from music_assistant.models.player import Player, _state_fingerprint
+from music_assistant.models.player_protocol import PlayerProtocol
+from music_assistant.models.setup_flow import (
+    AbortFlow,
+    SetupFlowContext,
+    SetupSession,
+    StepExpiredError,
+)
+from music_assistant.providers.filesystem_local.setup_flow import (
+    run_setup as filesystem_local_run_setup,
+)
+from music_assistant.providers.opensubsonic.setup_flow import run_setup as opensubsonic_run_setup
+from music_assistant.providers.opensubsonic.sonic_provider import CONF_BASE_URL
+from music_assistant.providers.qobuz.setup_flow import run_setup as qobuz_run_setup
+from tests.common import MockProtocol, MockProvider, set_music_source_access, use_player_registry
+from tests.controllers.storage.conftest import make_location, set_locations
+
+from .helpers import attach_on_config
+
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.event import MassEvent
+    from music_assistant_models.setup_flow import SetupFlowStep
+
+FAKE_DOMAIN = "_setup_flow_test"
+# a second domain, for the manifests only one test at a time needs
+GATE_DOMAIN = "_setup_flow_gate_test"
+
+USERNAME_ENTRY = ConfigEntry(key="username", type=ConfigEntryType.STRING, required=True)
+PORT_ENTRY = ConfigEntry(key="port", type=ConfigEntryType.INTEGER, required=False, default_value=80)
+PASSWORD_ENTRY = ConfigEntry(key="password", type=ConfigEntryType.SECURE_STRING, required=True)
+REGION_ENTRY = ConfigEntry(
+    key="region", type=ConfigEntryType.STRING, required=True, default_value="eu"
+)
+USE_PROXY_ENTRY = ConfigEntry(key="use_proxy", type=ConfigEntryType.BOOLEAN, default_value=False)
+# required with no default to fall back on, so only the gate keeps it satisfiable
+PROXY_HOST_ENTRY = ConfigEntry(
+    key="proxy_host", type=ConfigEntryType.STRING, required=True, depends_on=USE_PROXY_ENTRY.key
+)
+
+
+@pytest.fixture
+async def flow_mass(mass_minimal: MusicAssistant) -> AsyncGenerator[MusicAssistant]:
+    """
+    Provide a minimal server with a fake (flow-capable) provider manifest injected.
+
+    Builds on mass_minimal (no webserver/ports bound) and stubs the narrow surface
+    the flow engine touches: the dynamic-route webserver API, the streams publish IP
+    and the players/music controllers.
+    """
+    manifest = ProviderManifest(
+        type=ProviderType.MUSIC,
+        domain=FAKE_DOMAIN,
+        name="Setup Flow Test Provider",
+        description="Fake provider for setup flow tests",
+        codeowners=[],
+    )
+    mass_minimal._provider_manifests[FAKE_DOMAIN] = manifest
+    # stub the dynamic-route surface so external-step tests need no bound port
+    routes: dict[str, Any] = {}
+
+    def register_dynamic_route(path: str, handler: Any, _method: str = "*") -> Any:
+        routes[path] = handler
+        return lambda: routes.pop(path, None)
+
+    mass_minimal.webserver = SimpleNamespace(  # type: ignore[assignment]
+        base_url="http://test.local:8095",
+        register_dynamic_route=register_dynamic_route,
+        unregister_dynamic_route=lambda path, _method="*": routes.pop(path, None),
+        routes=routes,
+    )
+    mass_minimal.streams = SimpleNamespace(publish_ip="127.0.0.1")  # type: ignore[assignment]
+    mass_minimal.music = MagicMock()
+    # awaited at the tail of the real provider load path
+    mass_minimal.music.on_provider_loaded = AsyncMock()
+    # awaited at the head of the real provider unload path
+    mass_minimal.music.unschedule_provider_sync = AsyncMock()
+    # the real implementation, so the FINISH step's library-import copy is decided by the
+    # loaded provider's actual LIBRARY_* features rather than by a permissive mock;
+    # binding it to the mock is only sound because the method does not read self
+    mass_minimal.music.library_supported = MethodType(
+        MusicController.library_supported, mass_minimal.music
+    )
+    # the real implementation, as a provider load refuses another account through it
+    mass_minimal.music.mass = mass_minimal
+    mass_minimal.music.check_provider_account = MethodType(
+        MusicController.check_provider_account, mass_minimal.music
+    )
+    players = use_player_registry(mass_minimal)
+    players.on_player_config_change = AsyncMock()
+    players.on_protocol_config_change = AsyncMock()
+    mass_minimal.player_queues = MagicMock()
+    mass_minimal.player_queues.get.return_value = None
+    try:
+        yield mass_minimal
+    finally:
+        # abort any flow a test left behind so no tasks outlive the loop
+        for flow in list(mass_minimal.config._setup_flows.values()):
+            await mass_minimal.config._abort_flow(flow, reason="aborted")
+        if (sweep_handle := mass_minimal.config._flow_sweep_handle) is not None:
+            sweep_handle.cancel()
+        mass_minimal._provider_manifests.pop(FAKE_DOMAIN, None)
+
+
+@pytest.fixture
+def flow_events(flow_mass: MusicAssistant) -> list[MassEvent]:
+    """Capture all SETUP_FLOW_UPDATED events emitted during the test."""
+    events: list[MassEvent] = []
+    flow_mass.subscribe(events.append, EventType.SETUP_FLOW_UPDATED)
+    return events
+
+
+def _use_flow(mass: MusicAssistant, flow: Callable[[SetupSession], Awaitable[Any]]) -> Any:
+    """Patch the engine's flow module loader to serve the given run_setup coroutine."""
+    return patch.object(
+        mass.config,
+        "_get_setup_flow_module",
+        AsyncMock(return_value=SimpleNamespace(run_setup=flow)),
+    )
+
+
+async def _wait_for(predicate: Callable[[], Any], timeout: float = 5.0) -> Any:
+    """Wait until the predicate returns a truthy value (or fail the test)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if result := predicate():
+            return result
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met within timeout")
+
+
+def _abort_events(events: list[MassEvent]) -> list[SetupFlowStep]:
+    return [event.data for event in events if event.data.type == FlowStepType.ABORT]
+
+
+def _fake_json_session(payload: dict[str, Any], get_payload: dict[str, Any] | None = None) -> Any:
+    """
+    Return a stub http_session yielding 200 JSON responses.
+
+    :param payload: Body for .post() (the token exchange).
+    :param get_payload: Body for .get() (e.g. the Spotify account lookup); when omitted
+        .get() is left unstubbed.
+    """
+    response = SimpleNamespace(
+        status=200,
+        json=AsyncMock(return_value=payload),
+        text=AsyncMock(return_value=""),
+    )
+    post_cm = MagicMock()
+    post_cm.__aenter__ = AsyncMock(return_value=response)
+    post_cm.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.post = MagicMock(return_value=post_cm)
+    if get_payload is not None:
+        get_response = SimpleNamespace(
+            status=200,
+            json=AsyncMock(return_value=get_payload),
+            text=AsyncMock(return_value=""),
+        )
+        get_cm = MagicMock()
+        get_cm.__aenter__ = AsyncMock(return_value=get_response)
+        get_cm.__aexit__ = AsyncMock(return_value=False)
+        session.get = MagicMock(return_value=get_cm)
+    return session
+
+
+async def _fire_callback(flow_mass: MusicAssistant, flow_id: str, query: str) -> None:
+    """Hit a running flow's external-step callback route with the given query string."""
+    callback_path = f"/setup_flow/callback/{flow_id}"
+    handler = cast("Any", flow_mass.webserver).routes[callback_path]
+    response = await handler(make_mocked_request("GET", f"{callback_path}?{query}"))
+    assert response.status == 200
+
+
+async def test_zero_input_provider_immediate_finish(flow_mass: MusicAssistant) -> None:
+    """A provider without a setup_flow module is created right away with a FINISH step."""
+    no_module = AsyncMock(return_value=None)
+    with (
+        patch.object(flow_mass.config, "_get_setup_flow_module", no_module),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()) as mock_load,
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.type == FlowStepType.FINISH
+    assert step.result == {"instance_id": FAKE_DOMAIN}
+    mock_load.assert_awaited_once()
+    # the config was created and persisted (with empty values/setup_data)
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert raw_conf["domain"] == FAKE_DOMAIN
+    assert raw_conf["setup_data"] == {}
+    # no flow session was registered for the synthesized step
+    assert not flow_mass.config._setup_flows
+
+
+async def test_admin_creates_a_household_music_source(flow_mass: MusicAssistant) -> None:
+    """A music source an admin sets up carries no access record: it serves the household."""
+    set_current_user(User(user_id="admin", username="admin", role=UserRole.ADMIN))
+    with patch.object(flow_mass, "load_provider_config", AsyncMock()):
+        config = await flow_mass.config._create_provider_instance(FAKE_DOMAIN, {})
+
+    assert config.access is None
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}/access") is None
+
+
+async def test_member_creates_a_music_source_of_its_own(flow_mass: MusicAssistant) -> None:
+    """A music source a member sets up starts out private and owned by that member."""
+    set_current_user(User(user_id="member", username="member", role=UserRole.USER))
+    with patch.object(flow_mass, "load_provider_config", AsyncMock()):
+        config = await flow_mass.config._create_provider_instance(FAKE_DOMAIN, {})
+
+    assert config.access == ProviderAccess(owner="member", sharing=ProviderSharing.PRIVATE)
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}/access") == {
+        "owner": "member",
+        "sharing": "private",
+        "shared_users": [],
+    }
+
+
+async def test_adding_a_provider_leaves_onboarding_open(flow_mass: MusicAssistant) -> None:
+    """Onboarding completes when the wizard says so, not when the first provider is added."""
+    set_current_user(User(user_id="admin", username="admin", role=UserRole.ADMIN))
+    assert not flow_mass.config.onboard_done
+    with patch.object(flow_mass, "load_provider_config", AsyncMock()):
+        await flow_mass.config._create_provider_instance(FAKE_DOMAIN, {})
+
+    assert not flow_mass.config.onboard_done
+    await flow_mass.config.set_onboard_complete()
+    assert flow_mass.config.onboard_done
+
+
+class _FlowlessProvider(MusicProvider):
+    """
+    A genuine (minimal) provider for a domain that ships no setup_flow module.
+
+    Only get_config_entries is overridden so everything the load path does around it -
+    rehydrating the stored config against those entries, validating it and running async
+    init - behaves exactly as in production.
+    """
+
+    declared_entries: tuple[ConfigEntry, ...] = ()
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return the (options) config entries this provider declares."""
+        return self.declared_entries
+
+
+def _use_provider_module(
+    entries: tuple[ConfigEntry, ...], features: set[ProviderFeature] | None = None
+) -> Any:
+    """
+    Patch the module loader so the fake domain really loads a provider instance.
+
+    The fake domain has no importable package, so the module loader ``_load_provider`` uses
+    is served a stub module whose ``setup`` returns a real provider declaring the given entries.
+
+    :param entries: The (options) config entries the loaded provider declares.
+    :param features: The provider features the loaded provider declares.
+    """
+
+    async def setup(
+        mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+    ) -> _FlowlessProvider:
+        provider = _FlowlessProvider(mass, manifest, config, supported_features=features)
+        provider.declared_entries = entries
+        return provider
+
+    return patch(
+        "music_assistant.mass.load_provider_module",
+        AsyncMock(return_value=SimpleNamespace(setup=setup)),
+    )
+
+
+async def test_flowless_provider_loads_with_resolvable_entries(flow_mass: MusicAssistant) -> None:
+    """A flow-less provider whose options entries all resolve is added and actually loads."""
+    with (
+        patch.object(flow_mass.config, "_get_setup_flow_module", AsyncMock(return_value=None)),
+        _use_provider_module((PORT_ENTRY, REGION_ENTRY)),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.type == FlowStepType.FINISH
+    assert step.result == {"instance_id": FAKE_DOMAIN}
+    # the instance went through the real load path, not a stubbed one
+    provider = flow_mass.get_provider(FAKE_DOMAIN)
+    assert isinstance(provider, _FlowlessProvider)
+    assert provider.available
+    # it was created with values={}, yet the rehydrated config holds - and validates
+    # against - the provider's own entries
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")["values"] == {}
+    assert {"port", "region"} <= set(provider.config.values)
+    provider.config.validate()
+    assert provider.config.get_value("port") == 80
+    assert provider.config.get_value("region") == "eu"
+
+
+@pytest.mark.parametrize(
+    ("features", "expected_step_id"),
+    [
+        ({ProviderFeature.LIBRARY_TRACKS}, "finish_library_sync"),
+        (set(), "finish"),
+    ],
+    ids=["library_provider", "browse_only_provider"],
+)
+async def test_finish_step_id_reflects_library_import(
+    flow_mass: MusicAssistant, features: set[ProviderFeature], expected_step_id: str
+) -> None:
+    """Only a provider that imports a library gets the FINISH step explaining the import."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY], step_id="credentials")
+        await session.finish(values)
+
+    with _use_flow(flow_mass, run_setup), _use_provider_module((), features):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "marcel"})
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.step_id == expected_step_id
+
+
+async def test_zero_input_library_provider_finish_step_id(flow_mass: MusicAssistant) -> None:
+    """A flow-less provider's synthesized FINISH step carries the library-import copy too."""
+    with (
+        patch.object(flow_mass.config, "_get_setup_flow_module", AsyncMock(return_value=None)),
+        _use_provider_module((), {ProviderFeature.LIBRARY_PLAYLISTS}),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.type == FlowStepType.FINISH
+    assert step.step_id == "finish_library_sync"
+
+
+async def test_flowless_provider_required_entry_without_default_rolls_back(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A flow-less provider declaring a required entry with no default can not be added."""
+    with (
+        patch.object(flow_mass.config, "_get_setup_flow_module", AsyncMock(return_value=None)),
+        _use_provider_module((USERNAME_ENTRY,)),
+        # created with values={}, so validation of the rehydrated config has nothing to
+        # resolve the required entry from
+        pytest.raises(SetupFailedError, match="Configuration is invalid: username is required"),
+    ):
+        await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    # the config created before the load attempt is rolled back, leaving nothing half-created
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}") is None
+    assert flow_mass.get_provider(FAKE_DOMAIN, return_unavailable=True) is None
+
+
+async def test_form_flow_finish_success(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """A form flow persists its (encrypted) values as setup_data and loads the provider."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY, PASSWORD_ENTRY], step_id="credentials")
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()) as mock_load,
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.FORM
+        assert step.step_id == "credentials"
+        # entries are stamped with the provider's translation owner
+        assert all(x.translation_owner == f"provider.{FAKE_DOMAIN}" for x in step.entries)
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"username": "marcel", "password": "secret"}
+        )
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.result == {"instance_id": FAKE_DOMAIN}
+    mock_load.assert_awaited_once()
+    # values are stored in setup_data with strings encrypted at rest
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert raw_conf["setup_data"]["username"].startswith(ENCRYPT_SUFFIX)
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["username"]) == "marcel"
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["password"]) == "secret"
+    # the flow is cleaned up after finishing
+    assert step.flow_id not in flow_mass.config._setup_flows
+    # both steps were pushed as events
+    await _wait_for(lambda: len(flow_events) >= 2)
+    assert [event.data.type for event in flow_events[:2]] == [
+        FlowStepType.FORM,
+        FlowStepType.FINISH,
+    ]
+    assert all(event.object_id == step.flow_id for event in flow_events)
+
+
+async def test_form_flow_translation_params(flow_mass: MusicAssistant) -> None:
+    """A form step exposes translation parameters for its title and description."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form(
+            [USERNAME_ENTRY],
+            step_id="credentials",
+            translation_params=["https://example.com/callback"],
+            copy_text="copy-value",
+        )
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.translation_params == ["https://example.com/callback"]
+        assert step.copy_text == "copy-value"
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+
+
+async def test_form_validation_errors(flow_mass: MusicAssistant) -> None:
+    """Invalid submitted values return the FORM step with errors, without advancing the flow."""
+    advanced = asyncio.Event()
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY, PORT_ENTRY])
+        advanced.set()
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        # missing required value + unparsable integer
+        error_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"port": "not-a-number"}
+        )
+        assert error_step.type == FlowStepType.FORM
+        assert error_step.errors == {"username": "required", "port": "invalid_value"}
+        assert not advanced.is_set()
+        assert step.flow_id in flow_mass.config._setup_flows
+        # a valid re-submit picks up where the form left off
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"username": "marcel", "port": 8095}
+        )
+    assert advanced.is_set()
+    assert finish_step.type == FlowStepType.FINISH
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert raw_conf["setup_data"]["port"] == 8095
+
+
+async def test_gated_required_entry_does_not_block_submit(flow_mass: MusicAssistant) -> None:
+    """A required entry behind an unmet dependency renders disabled, so it may stay empty."""
+    submitted: dict[str, ConfigValueType] = {}
+
+    async def run_setup(session: SetupSession) -> None:
+        submitted.update(await session.form([USE_PROXY_ENTRY, PROXY_HOST_ENTRY]))
+        await session.finish(submitted)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"use_proxy": False})
+    assert finish_step.type == FlowStepType.FINISH
+    assert submitted == {"use_proxy": False, "proxy_host": None}
+
+
+async def test_gated_required_entry_is_demanded_once_its_gate_opens(
+    flow_mass: MusicAssistant,
+) -> None:
+    """Opening the gate in the same submit makes the entry required again."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.finish(await session.form([USE_PROXY_ENTRY, PROXY_HOST_ENTRY]))
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        error_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"use_proxy": True})
+        assert error_step.type == FlowStepType.FORM
+        assert error_step.errors == {"proxy_host": "required"}
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+
+
+async def test_gate_is_read_from_the_submitted_values(flow_mass: MusicAssistant) -> None:
+    """Closing a prefilled gate takes effect wherever the gate sits on the form."""
+    submitted: dict[str, ConfigValueType] = {}
+
+    async def run_setup(session: SetupSession) -> None:
+        # gate listed behind what it gates, and prefilled as a reconfigure run would
+        submitted.update(
+            await session.form([PROXY_HOST_ENTRY, replace(USE_PROXY_ENTRY, value=True)])
+        )
+        await session.finish(submitted)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"use_proxy": False})
+    assert finish_step.type == FlowStepType.FINISH
+    assert submitted == {"use_proxy": False, "proxy_host": None}
+
+
+async def test_submit_returns_next_form_step(flow_mass: MusicAssistant) -> None:
+    """Submitting a multi-step flow returns the next FORM step."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY], step_id="first")
+        values = await session.form([PORT_ENTRY], step_id="second", last_step=True)
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.step_id == "first"
+        second_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "marcel"})
+        assert second_step.type == FlowStepType.FORM
+        assert second_step.step_id == "second"
+        assert second_step.last_step is True
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"port": 1234})
+        assert finish_step.type == FlowStepType.FINISH
+
+
+@pytest.mark.usefixtures("flow_events")
+async def test_finish_failure_rolls_back_provider_config(flow_mass: MusicAssistant) -> None:
+    """A failing provider load on finish removes the created config again."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY])
+        # SetupFlowError deliberately not caught: flow ends with the failure message
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(
+            flow_mass, "load_provider_config", AsyncMock(side_effect=LoginFailed("bad creds"))
+        ),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        abort_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+    assert abort_step.type == FlowStepType.ABORT
+    assert abort_step.reason == "bad creds"
+    # the config created during finish was removed again
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}") is None
+    assert step.flow_id not in flow_mass.config._setup_flows
+
+
+async def test_uncaught_finish_error_localizes_abort(flow_mass: MusicAssistant) -> None:
+    """An uncaught provider error is localized per client without losing its arguments."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY])
+        await session.finish(values)
+
+    address = "https://navidrome.example"
+    error = LoginFailed(
+        f"Failed to connect to {address}",
+        translation_key="connect_failed",
+        translation_args=[address],
+        translation_owner="provider.opensubsonic",
+    )
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock(side_effect=error)),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        abort_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+    assert abort_step.type == FlowStepType.ABORT
+    translations = TranslationController(flow_mass)
+    for locale, template in (
+        ("de", "Verbindung zu {0} fehlgeschlagen."),
+        ("nl", "Verbinding met {0} mislukt."),
+    ):
+        translations._locales[locale] = {"provider.opensubsonic.errors.connect_failed": template}
+        token = TRANSLATION_RESOLVER.set(partial(translations.get_translation, locale=locale))
+        try:
+            serialized = abort_step.to_dict()
+        finally:
+            TRANSLATION_RESOLVER.reset(token)
+        assert serialized["reason"] == template.format(address)
+        assert "reason_translation" not in serialized
+        assert abort_step.reason == str(error)
+
+
+async def test_finish_failure_author_retry_loop(flow_mass: MusicAssistant) -> None:
+    """An author can catch SetupFlowError and re-render the form with the error."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY])
+        while True:
+            try:
+                await session.finish(values)
+                return
+            except Exception as err:
+                values = await session.form([USERNAME_ENTRY], errors={"base": str(err)})
+
+    load_mock = AsyncMock(side_effect=[LoginFailed("bad creds"), None])
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", load_mock),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        retry_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+        assert retry_step.type == FlowStepType.FORM
+        assert retry_step.errors == {"base": "bad creds"}
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "y"})
+    assert finish_step.type == FlowStepType.FINISH
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}") is not None
+
+
+async def test_external_step_callback_roundtrip(flow_mass: MusicAssistant) -> None:
+    """An external step resumes the flow with the merged callback (query) params."""
+    received: dict[str, str] = {}
+
+    async def run_setup(session: SetupSession) -> None:
+        assert session.callback_path == f"/setup_flow/callback/{session.flow_id}"
+        assert session.callback_url.endswith(f"/setup_flow/callback/{session.flow_id}")
+        received.update(await session.external("https://example.com/authorize"))
+        await session.finish({"token": received["code"]})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.EXTERNAL
+        assert step.url == "https://example.com/authorize"
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        # the callback route was registered on the webserver (stub) for this flow
+        registered_routes = cast("Any", flow_mass.webserver).routes
+        callback_path = f"/setup_flow/callback/{step.flow_id}"
+        handler = registered_routes[callback_path]
+        request = make_mocked_request("GET", f"{callback_path}?code=abc&state=xyz")
+        response = await handler(request)
+        assert response.status == 200
+        await _wait_for(lambda: session.finished)
+    assert received == {"code": "abc", "state": "xyz"}
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["token"]) == "abc"
+    # the route is released again when the flow ends
+    await _wait_for(lambda: callback_path not in registered_routes)
+
+
+async def test_external_step_replaced_by_progress_on_callback(flow_mass: MusicAssistant) -> None:
+    """The external step gives way to a progress step while the callback is processed."""
+    release = asyncio.Event()
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.external("https://example.com/authorize")
+        await release.wait()
+        await session.finish({})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        callback_path = f"/setup_flow/callback/{step.flow_id}"
+        handler = cast("Any", flow_mass.webserver).routes[callback_path]
+        await handler(make_mocked_request("GET", f"{callback_path}?code=abc"))
+        progress_step = await _wait_for(
+            lambda: (
+                session.current_step
+                if session.current_step is not None
+                and session.current_step.type == FlowStepType.PROGRESS
+                else None
+            )
+        )
+        assert progress_step.step_id == "working"
+        release.set()
+        await _wait_for(lambda: session.finished)
+
+
+async def test_external_expiry_aborts_flow(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """An external step whose callback never arrives times out and releases its route."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.external("https://example.com/authorize", expires_in=0.05)
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.expires_at is not None
+        abort_step = await _wait_for(
+            lambda: next(iter(_abort_events(flow_events)), None), timeout=2
+        )
+    assert abort_step.reason == "timed_out"
+    assert step.flow_id not in flow_mass.config._setup_flows
+    # the expired step is not followed by a progress step: nothing was completed
+    assert not [event.data for event in flow_events if event.data.type == FlowStepType.PROGRESS]
+    registered_routes = cast("Any", flow_mass.webserver).routes
+    assert f"/setup_flow/callback/{step.flow_id}" not in registered_routes
+
+
+async def test_external_callback_json_body_coerced(flow_mass: MusicAssistant) -> None:
+    """A JSON callback body with non-string values is coerced to the str params contract."""
+    received: dict[str, str] = {}
+
+    async def run_setup(session: SetupSession) -> None:
+        received.update(await session.external("https://example.com/authorize"))
+        await session.finish({})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        request = SimpleNamespace(
+            query={"state": "xyz"},
+            method="POST",
+            can_read_body=True,
+            content_type="application/json",
+            read=AsyncMock(return_value=b'{"code": 123, "granted": true}'),
+        )
+        response = await session.handle_callback(cast("Any", request))
+        assert response.status == 200
+        await _wait_for(lambda: session.finished)
+    assert received == {"state": "xyz", "code": "123", "granted": "True"}
+
+
+async def test_form_expiry_aborts_flow(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """An uncaught form deadline converts into a timed_out ABORT."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY], expires_in=0.05)
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.expires_at is not None
+        abort_step = await _wait_for(
+            lambda: next(iter(_abort_events(flow_events)), None), timeout=2
+        )
+    assert abort_step.reason == "timed_out"
+    assert step.flow_id not in flow_mass.config._setup_flows
+
+
+async def test_form_expiry_author_refresh(flow_mass: MusicAssistant) -> None:
+    """An author can catch StepExpiredError and refresh the step in place."""
+
+    async def run_setup(session: SetupSession) -> None:
+        try:
+            await session.form([USERNAME_ENTRY], step_id="short_lived", expires_in=0.05)
+        except StepExpiredError:
+            await session.form([USERNAME_ENTRY], step_id="refreshed")
+        await session.finish({})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.step_id == "short_lived"
+        flow = flow_mass.config._setup_flows[step.flow_id]
+        await _wait_for(
+            lambda: flow.session.current_step and flow.session.current_step.step_id == "refreshed",
+            timeout=2,
+        )
+        # the refreshed step accepts input as usual
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+        assert finish_step.type == FlowStepType.FINISH
+
+
+async def test_progress_until_expiry(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """progress_until enforces its deadline by raising StepExpiredError into the flow."""
+
+    async def run_setup(session: SetupSession) -> None:
+        try:
+            await session.progress_until(
+                asyncio.sleep(30), "waiting_for_device", text="press_button", expires_in=0.05
+            )
+        except StepExpiredError:
+            raise AbortFlow("pairing_window_closed") from None
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.PROGRESS
+        assert step.progress_text == "press_button"
+        assert step.expires_at is not None
+        abort_step = await _wait_for(
+            lambda: next(iter(_abort_events(flow_events)), None), timeout=2
+        )
+    assert abort_step.reason == "pairing_window_closed"
+
+
+async def test_abort_runs_author_cleanup(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """Aborting a flow cancels the coroutine so the author's finally cleanup runs."""
+    cleanup_ran = asyncio.Event()
+
+    async def run_setup(session: SetupSession) -> None:
+        try:
+            await session.form([USERNAME_ENTRY])
+        finally:
+            cleanup_ran.set()
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+    assert cleanup_ran.is_set()
+    assert step.flow_id not in flow_mass.config._setup_flows
+    abort_step = await _wait_for(lambda: next(iter(_abort_events(flow_events)), None))
+    assert abort_step.reason == "aborted"
+    # continuing an aborted flow is rejected
+    with pytest.raises(KeyError):
+        await flow_mass.config.get_setup_flow(step.flow_id)
+
+
+async def test_idle_flow_ttl_sweep(flow_mass: MusicAssistant, flow_events: list[MassEvent]) -> None:
+    """The periodic sweeper aborts flows that have been idle for longer than the TTL."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY])
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        flow = flow_mass.config._setup_flows[step.flow_id]
+        flow.session.last_activity = time.monotonic() - 16 * 60
+        flow_mass.config._sweep_idle_flows()
+        await _wait_for(lambda: step.flow_id not in flow_mass.config._setup_flows)
+    abort_step = await _wait_for(lambda: next(iter(_abort_events(flow_events)), None))
+    assert abort_step.reason == "timed_out"
+
+
+async def test_idle_sweep_respects_live_step_deadline(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """The sweeper must not abort a flow whose current step advertises a longer deadline."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY], expires_in=3600)
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        flow = flow_mass.config._setup_flows[step.flow_id]
+        flow.session.last_activity = time.monotonic() - 16 * 60
+        flow_mass.config._sweep_idle_flows()
+        await asyncio.sleep(0.05)
+        # still alive: the step's own countdown is the authoritative deadline
+        assert step.flow_id in flow_mass.config._setup_flows
+        assert not _abort_events(flow_events)
+
+
+async def test_concurrent_starts_keep_single_flow(flow_mass: MusicAssistant) -> None:
+    """Two concurrent starts for the same target never leave two live flows behind."""
+
+    async def run_setup(session: SetupSession) -> None:
+        try:
+            await session.form([USERNAME_ENTRY])
+        finally:
+            # slow author cleanup: widens the abort window the re-scan protects against
+            await asyncio.sleep(0.05)
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        await asyncio.gather(
+            flow_mass.config.setup_provider(FAKE_DOMAIN),
+            flow_mass.config.setup_provider(FAKE_DOMAIN),
+        )
+        target_flows = [
+            flow
+            for flow in flow_mass.config._setup_flows.values()
+            if flow.target_key == f"provider_setup:{FAKE_DOMAIN}"
+        ]
+        assert len(target_flows) <= 1
+
+
+async def test_finish_twice_raises(flow_mass: MusicAssistant, flow_events: list[MassEvent]) -> None:
+    """A second finish() call is a flow-author bug and must not create a second target."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.finish({})
+        await session.finish({})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        abort_step = await _wait_for(lambda: next(iter(_abort_events(flow_events)), None))
+    assert abort_step.reason == "internal_error"
+    # the first finish still created (exactly one) provider config
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")["domain"] == FAKE_DOMAIN
+
+
+async def test_bare_callback_does_not_extend_ttl(flow_mass: MusicAssistant) -> None:
+    """The unauthenticated callback route must not keep an idle flow alive (no pending external)."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY])
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        flow = flow_mass.config._setup_flows[step.flow_id]
+        activity_before = flow.session.last_activity
+        # the callback route is only registered while an external step is pending,
+        # but the session handler itself must also not count a bare hit as activity
+        request = make_mocked_request("GET", f"/setup_flow/callback/{step.flow_id}?foo=bar")
+        await flow.session.handle_callback(request)
+        assert flow.session.last_activity == activity_before
+
+
+async def test_submit_timeout_returns_transient_progress(flow_mass: MusicAssistant) -> None:
+    """A submit whose next step is slow returns a progress step, not the consumed form."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY])
+        await asyncio.sleep(0.3)
+        await session.form([PORT_ENTRY], step_id="second")
+        await session.finish({})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch("music_assistant.controllers.config.flows.NEXT_STEP_TIMEOUT", 0.05),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        result = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+        assert result.type == FlowStepType.PROGRESS
+        assert result.flow_id == step.flow_id
+
+        # the real next step still arrives (idempotent get picks it up)
+        def _second_form() -> SetupFlowStep | None:
+            current = flow_mass.config._setup_flows[step.flow_id].session.current_step
+            if current is not None and current.step_id == "second":
+                return current
+            return None
+
+        next_step = await _wait_for(_second_form)
+        assert next_step.type == FlowStepType.FORM
+
+
+async def test_aborted_flow_scope_still_resolvable(flow_mass: MusicAssistant) -> None:
+    """A cancel-driven ABORT publishes after the pop; its scope must still resolve."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY])
+        await session.finish({})
+
+    resolvable_at_publish: list[bool] = []
+
+    def on_event(event: MassEvent) -> None:
+        if event.data.type == FlowStepType.ABORT and event.object_id:
+            resolvable_at_publish.append(
+                flow_mass.config.get_setup_flow_access(event.object_id) is not None
+            )
+
+    flow_mass.subscribe(on_event, EventType.SETUP_FLOW_UPDATED)
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+    # event delivery is async (call_soon); wait for the callback to run
+    await _wait_for(lambda: resolvable_at_publish)
+    assert resolvable_at_publish == [True]
+    assert flow_mass.config.get_setup_flow_access(step.flow_id) == SetupFlowAccess(
+        Scope.CONFIG_PROVIDERS_OWN
+    )
+
+
+async def test_setup_flow_access_accessor(flow_mass: MusicAssistant) -> None:
+    """The event filter's access accessor reports the flow's scope while it runs."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY])
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert flow_mass.config.get_setup_flow_access(step.flow_id) == SetupFlowAccess(
+            Scope.CONFIG_PROVIDERS_OWN
+        )
+    assert flow_mass.config.get_setup_flow_access("nonexistent") is None
+
+
+def _use_multi_account_manifest(flow_mass: MusicAssistant) -> None:
+    """Turn the fake provider into a music service that allows more than one account."""
+    manifest = flow_mass._provider_manifests[FAKE_DOMAIN]
+    flow_mass._provider_manifests[FAKE_DOMAIN] = replace(manifest, multi_instance=True)
+
+
+async def _credentials_flow(session: SetupSession) -> None:
+    """Run a single-form setup flow that finishes with the submitted values."""
+    values = await session.form([USERNAME_ENTRY])
+    await session.finish(values)
+
+
+async def test_a_member_owns_the_flow_it_starts(flow_mass: MusicAssistant) -> None:
+    """A setup flow a member starts is its own; only that member and an admin may use it."""
+    member = User(user_id="member", username="member", role=UserRole.USER)
+    other = User(user_id="other", username="other", role=UserRole.USER)
+    admin = User(user_id="admin", username="admin", role=UserRole.ADMIN)
+    _use_multi_account_manifest(flow_mass)
+    set_current_user(member)
+
+    with _use_flow(flow_mass, _credentials_flow):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+
+    access = flow_mass.config.get_setup_flow_access(step.flow_id)
+    assert access is not None
+    assert access == SetupFlowAccess(Scope.CONFIG_PROVIDERS_OWN, member.user_id)
+    assert access.allows(member)
+    assert access.allows(admin)
+    assert not access.allows(other)
+    assert not access.allows(User(user_id="guest", username="guest", role=UserRole.GUEST))
+    assert not access.allows(User(user_id="service", username="service", role=UserRole.SERVICE))
+
+
+async def test_another_member_can_not_continue_a_members_flow(flow_mass: MusicAssistant) -> None:
+    """Only the member that started a setup flow (and an admin) may drive it."""
+    member = User(user_id="member", username="member", role=UserRole.USER)
+    other = User(user_id="other", username="other", role=UserRole.USER)
+    admin = User(user_id="admin", username="admin", role=UserRole.ADMIN)
+    _use_multi_account_manifest(flow_mass)
+    set_current_user(member)
+
+    with (
+        _use_flow(flow_mass, _credentials_flow),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        set_current_user(other)
+        with pytest.raises(InsufficientPermissions, match="who started this setup flow"):
+            await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "sneak"})
+        with pytest.raises(InsufficientPermissions, match="who started this setup flow"):
+            await flow_mass.config.get_setup_flow(step.flow_id)
+        with pytest.raises(InsufficientPermissions, match="who started this setup flow"):
+            await flow_mass.config.abort_setup_flow(step.flow_id)
+        assert step.flow_id in flow_mass.config._setup_flows
+
+        set_current_user(admin)
+        assert (await flow_mass.config.get_setup_flow(step.flow_id)).step_id == step.step_id
+
+        set_current_user(member)
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "m"})
+
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.result is not None
+    instance_id = finish_step.result["instance_id"]
+    assert instance_id.startswith(f"{FAKE_DOMAIN}--")
+    assert (
+        flow_mass.config.get(f"{CONF_PROVIDERS}/{instance_id}/access")
+        == ProviderAccess(owner=member.user_id, sharing=ProviderSharing.PRIVATE).to_dict()
+    )
+    # the finished flow keeps its record, so a late terminal step still resolves
+    assert flow_mass.config.get_setup_flow_access(step.flow_id) == SetupFlowAccess(
+        Scope.CONFIG_PROVIDERS_OWN, member.user_id
+    )
+
+
+async def test_a_server_started_flow_has_no_owner(flow_mass: MusicAssistant) -> None:
+    """A flow the server itself starts belongs to nobody, so every member may pick it up."""
+    set_current_user(None)
+
+    with _use_flow(flow_mass, _credentials_flow):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        access = flow_mass.config.get_setup_flow_access(step.flow_id)
+        assert access is not None
+        assert access.owner_user_id is None
+        set_current_user(User(user_id="member", username="member", role=UserRole.USER))
+        assert (await flow_mass.config.get_setup_flow(step.flow_id)).flow_id == step.flow_id
+
+
+@pytest.mark.parametrize(
+    "manifest_changes",
+    [
+        {},
+        {"builtin": True, "multi_instance": True},
+        {"type": ProviderType.PLAYER, "multi_instance": True},
+        {"multi_instance": True, "self_service": False},
+    ],
+    ids=["single_account", "builtin", "player", "no_self_service"],
+)
+async def test_a_member_may_not_add_a_provider_it_can_not_own(
+    flow_mass: MusicAssistant, manifest_changes: dict[str, Any]
+) -> None:
+    """
+    A member only adds a music service that allows more than one account and self-service.
+
+    :param manifest_changes: The manifest attributes that put the provider off limits.
+    """
+    flow_mass._provider_manifests[GATE_DOMAIN] = replace(
+        flow_mass._provider_manifests[FAKE_DOMAIN], domain=GATE_DOMAIN, **manifest_changes
+    )
+    set_current_user(User(user_id="member", username="member", role=UserRole.USER))
+
+    try:
+        with (
+            _use_flow(flow_mass, _credentials_flow),
+            pytest.raises(InsufficientPermissions, match="is required to add"),
+        ):
+            await flow_mass.config.setup_provider(GATE_DOMAIN)
+    finally:
+        flow_mass._provider_manifests.pop(GATE_DOMAIN, None)
+
+    # the refusal lands before anything is started or created
+    assert not flow_mass.config._setup_flows
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{GATE_DOMAIN}") is None
+
+
+@pytest.mark.parametrize(
+    ("role", "multi_instance"),
+    [(UserRole.USER, True), (UserRole.ADMIN, False)],
+    ids=["member_adds_a_multi_account_service", "admin_adds_a_single_account_service"],
+)
+async def test_the_provider_setup_flow_starts_for_a_permitted_caller(
+    flow_mass: MusicAssistant, role: str, multi_instance: bool
+) -> None:
+    """
+    A member adds a multi-account music service, an admin adds any of them.
+
+    :param role: Role id of the calling user.
+    :param multi_instance: Whether the provider allows more than one account.
+    """
+    if multi_instance:
+        _use_multi_account_manifest(flow_mass)
+    set_current_user(User(user_id="caller", username="caller", role=role))
+
+    with _use_flow(flow_mass, _credentials_flow):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+
+    assert step.type == FlowStepType.FORM
+
+
+async def test_members_add_their_own_account_of_a_service_side_by_side(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A member's add flow for a multi-account service leaves another member's flow running."""
+    member = User(user_id="member", username="member", role=UserRole.USER)
+    other = User(user_id="other", username="other", role=UserRole.USER)
+    _use_multi_account_manifest(flow_mass)
+
+    with _use_flow(flow_mass, _credentials_flow):
+        set_current_user(member)
+        member_step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        set_current_user(other)
+        other_step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert set(flow_mass.config._setup_flows) == {member_step.flow_id, other_step.flow_id}
+        # a member starting over replaces its own flow and nobody else's
+        set_current_user(member)
+        restarted_step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+
+    assert set(flow_mass.config._setup_flows) == {restarted_step.flow_id, other_step.flow_id}
+
+
+async def test_a_member_may_only_reconfigure_the_source_it_owns(flow_mass: MusicAssistant) -> None:
+    """Reconfiguring a music source (reauth included) is up to its owner and an admin."""
+    member = User(user_id="member", username="member", role=UserRole.USER)
+    other = User(user_id="other", username="other", role=UserRole.USER)
+    admin = User(user_id="admin", username="admin", role=UserRole.ADMIN)
+    own_instance = f"{FAKE_DOMAIN}--own"
+    other_instance = f"{FAKE_DOMAIN}--other"
+    household_instance = f"{FAKE_DOMAIN}--house"
+    set_music_source_access(
+        flow_mass,
+        {
+            own_instance: ProviderAccess(owner=member.user_id, sharing=ProviderSharing.PRIVATE),
+            other_instance: ProviderAccess(owner=other.user_id, sharing=ProviderSharing.PRIVATE),
+            household_instance: None,
+        },
+    )
+
+    with _use_flow(flow_mass, _credentials_flow):
+        set_current_user(member)
+        step = await flow_mass.config.reconfigure_provider(own_instance)
+        assert step.type == FlowStepType.FORM
+        access = flow_mass.config.get_setup_flow_access(step.flow_id)
+        assert access is not None
+        assert access.owner_user_id == member.user_id
+        for instance_id in (other_instance, household_instance):
+            with pytest.raises(InsufficientPermissions, match="required to manage"):
+                await flow_mass.config.reconfigure_provider(instance_id)
+        # a source that does not exist is refused on existence, not on ownership
+        with pytest.raises(KeyError):
+            await flow_mass.config.reconfigure_provider(f"{FAKE_DOMAIN}--gone")
+        assert set(flow_mass.config._setup_flows) == {step.flow_id}
+
+        set_current_user(admin)
+        for instance_id in (own_instance, other_instance, household_instance):
+            admin_step = await flow_mass.config.reconfigure_provider(instance_id)
+            assert admin_step.type == FlowStepType.FORM
+
+
+@pytest.mark.parametrize(
+    ("user", "manages_all_sources"),
+    [
+        (None, True),
+        (User(user_id="admin", username="admin", role=UserRole.ADMIN), True),
+        (User(user_id="member", username="member", role=UserRole.USER), False),
+    ],
+    ids=["server", "admin", "member"],
+)
+async def test_a_flow_knows_its_caller(
+    flow_mass: MusicAssistant, user: User | None, manages_all_sources: bool
+) -> None:
+    """
+    Setting up and reconfiguring tell the flow its caller, and whether it manages every source.
+
+    :param user: The calling user, None for the server itself.
+    :param manages_all_sources: Whether that caller manages every music source.
+    """
+    _use_multi_account_manifest(flow_mass)
+    instance_id = f"{FAKE_DOMAIN}--own"
+    set_music_source_access(
+        flow_mass,
+        {instance_id: ProviderAccess(owner="member", sharing=ProviderSharing.PRIVATE)},
+    )
+    contexts: list[SetupFlowContext] = []
+
+    async def run_setup(session: SetupSession) -> None:
+        contexts.append(session.context)
+        await _credentials_flow(session)
+
+    set_current_user(user)
+    with _use_flow(flow_mass, run_setup):
+        await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        await flow_mass.config.reconfigure_provider(instance_id)
+
+    assert [(context.kind, context.user, context.manages_all_sources) for context in contexts] == [
+        ("setup", user, manages_all_sources),
+        ("reconfigure", user, manages_all_sources),
+    ]
+
+
+async def test_only_an_admin_sets_up_or_reconfigures_a_provider_without_self_service(
+    flow_mass: MusicAssistant,
+) -> None:
+    """Only an admin picks what such a provider reads, also for a source a member owns."""
+    member = User(user_id="member", username="member", role=UserRole.USER)
+    admin = User(user_id="admin", username="admin", role=UserRole.ADMIN)
+    manifest = flow_mass._provider_manifests[FAKE_DOMAIN]
+    flow_mass._provider_manifests[FAKE_DOMAIN] = replace(
+        manifest, multi_instance=True, self_service=False
+    )
+    own_instance = f"{FAKE_DOMAIN}--own"
+    set_music_source_access(
+        flow_mass,
+        {own_instance: ProviderAccess(owner=member.user_id, sharing=ProviderSharing.PRIVATE)},
+    )
+
+    with _use_flow(flow_mass, _credentials_flow):
+        set_current_user(member)
+        with pytest.raises(InsufficientPermissions, match="is required to add"):
+            await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        with pytest.raises(InsufficientPermissions, match="is required to add"):
+            await flow_mass.config.reconfigure_provider(own_instance)
+        assert not flow_mass.config._setup_flows
+
+        set_current_user(admin)
+        setup_step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        reconfigure_step = await flow_mass.config.reconfigure_provider(own_instance)
+        assert setup_step.type == reconfigure_step.type == FlowStepType.FORM
+
+
+async def test_one_flow_per_target_replaces(
+    flow_mass: MusicAssistant, flow_events: list[MassEvent]
+) -> None:
+    """Starting a flow for a target that already has one aborts the old flow."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([USERNAME_ENTRY])
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        first_step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        second_step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert first_step.flow_id != second_step.flow_id
+    assert first_step.flow_id not in flow_mass.config._setup_flows
+    assert second_step.flow_id in flow_mass.config._setup_flows
+    replaced = await _wait_for(lambda: next(iter(_abort_events(flow_events)), None))
+    assert replaced.flow_id == first_step.flow_id
+    assert replaced.reason == "replaced"
+
+
+async def test_get_flow_is_idempotent(flow_mass: MusicAssistant) -> None:
+    """config/flows/get re-renders the current step without ever advancing the flow."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([USERNAME_ENTRY])
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        for _ in range(3):
+            fetched = await flow_mass.config.get_setup_flow(step.flow_id)
+            assert fetched.type == FlowStepType.FORM
+            assert fetched.step_id == step.step_id
+            assert fetched.flow_id == step.flow_id
+        # the flow still accepts input afterwards
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+        assert finish_step.type == FlowStepType.FINISH
+
+
+async def test_submit_without_pending_form(flow_mass: MusicAssistant) -> None:
+    """Submitting while no FORM step is pending is rejected."""
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.external("https://example.com/authorize")
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.EXTERNAL
+        with pytest.raises(ActionUnavailable):
+            await flow_mass.config.submit_setup_flow(step.flow_id, {"username": "x"})
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+
+
+@pytest.mark.usefixtures("flow_events")
+async def test_form_entries_with_action_rejected(flow_mass: MusicAssistant) -> None:
+    """The engine rejects FORM entries that carry an action (banned inside flows)."""
+    action_entry = ConfigEntry(
+        key="authenticate", type=ConfigEntryType.STRING, action="auth", required=False
+    )
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([action_entry])
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    # the ValueError ends the flow as an internal error
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "internal_error"
+
+
+@pytest.mark.usefixtures("flow_events")
+async def test_form_entries_with_action_type_rejected(flow_mass: MusicAssistant) -> None:
+    """The engine rejects FORM entries of type ACTION (they render dead in the dialog)."""
+    action_entry = ConfigEntry(key="authenticate", type=ConfigEntryType.ACTION, required=False)
+
+    async def run_setup(session: SetupSession) -> None:
+        await session.form([action_entry])
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    # the ValueError ends the flow as an internal error
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "internal_error"
+
+
+async def test_reconfigure_prefill_and_success(flow_mass: MusicAssistant) -> None:
+    """Reconfigure decrypts setup_data for prefill and merges the new values on finish."""
+    instance_id = FAKE_DOMAIN
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{instance_id}",
+        {
+            "type": "music",
+            "domain": FAKE_DOMAIN,
+            "instance_id": instance_id,
+            "enabled": True,
+            "values": {"region": "eu"},
+            "setup_data": {
+                "token": flow_mass.config.encrypt_string("old-secret"),
+                "device_id": flow_mass.config.encrypt_string("device-1"),
+            },
+            "last_error": {"error_code": LoginFailed.error_code, "message": "expired"},
+        },
+    )
+    contexts: list[Any] = []
+
+    async def run_setup(session: SetupSession) -> None:
+        contexts.append(session.context)
+        values = await session.form([ConfigEntry(key="token", type=ConfigEntryType.STRING)])
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()) as mock_load,
+    ):
+        step = await flow_mass.config.reconfigure_provider(instance_id)
+        assert step.type == FlowStepType.FORM
+        context = contexts[0]
+        assert context.kind == "reconfigure"
+        assert context.reason == "auth"
+        assert context.instance_id == instance_id
+        assert context.setup_data == {"token": "old-secret", "device_id": "device-1"}
+        assert context.values == {"region": "eu"}
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"token": "new-secret"}
+        )
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.result == {"instance_id": instance_id}
+    # the library of an existing instance is already there, so no import copy is offered
+    assert finish_step.step_id == "finish"
+    mock_load.assert_awaited_once()
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{instance_id}")
+    # new value merged in (encrypted), untouched keys preserved, last_error cleared
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["token"]) == "new-secret"
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["device_id"]) == "device-1"
+    assert raw_conf["last_error"] is None
+
+
+async def test_reconfigure_failure_restores_setup_data(flow_mass: MusicAssistant) -> None:
+    """A failing reload on reconfigure finish restores the previous setup_data."""
+    instance_id = FAKE_DOMAIN
+    original_setup_data = {"token": flow_mass.config.encrypt_string("old-secret")}
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{instance_id}",
+        {
+            "type": "music",
+            "domain": FAKE_DOMAIN,
+            "instance_id": instance_id,
+            "enabled": True,
+            "values": {},
+            "setup_data": dict(original_setup_data),
+        },
+    )
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([ConfigEntry(key="token", type=ConfigEntryType.STRING)])
+        await session.finish(values)
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(
+            flow_mass, "load_provider_config", AsyncMock(side_effect=LoginFailed("still bad"))
+        ),
+    ):
+        step = await flow_mass.config.reconfigure_provider(instance_id)
+        abort_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"token": "bogus"})
+    assert abort_step.type == FlowStepType.ABORT
+    assert abort_step.reason == "still bad"
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{instance_id}")
+    assert raw_conf["setup_data"] == original_setup_data
+
+
+class _AccountProvider(_FlowlessProvider):
+    """A provider signed in to the account whose token its config holds."""
+
+    account = ""
+
+    @property
+    def account_id(self) -> str | None:
+        """Return the account whose token the config holds, None without one."""
+        return self.account or None
+
+
+def _use_account_provider() -> Any:
+    """Patch the module loader so the fake domain loads an _AccountProvider."""
+
+    async def setup(
+        mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+    ) -> _AccountProvider:
+        provider = _AccountProvider(mass, manifest, config)
+        setup_data = mass.config.get(f"{CONF_PROVIDERS}/{config.instance_id}/setup_data")
+        provider.account = mass.config.decrypt_string(setup_data["token"])
+        return provider
+
+    return patch(
+        "music_assistant.mass.load_provider_module",
+        AsyncMock(return_value=SimpleNamespace(setup=setup)),
+    )
+
+
+def _store_account_provider(
+    flow_mass: MusicAssistant, account: str, bound_account: str | None = None
+) -> str:
+    """Store the config of an instance of the fake domain holding the given account's token."""
+    instance_id = f"{FAKE_DOMAIN}--a1b2c3d4"
+    setup_data = {"token": flow_mass.config.encrypt_string(account)}
+    if bound_account is not None:
+        setup_data[CONF_BOUND_ACCOUNT_ID] = flow_mass.config.encrypt_string(bound_account)
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{instance_id}",
+        {
+            "type": "music",
+            "domain": FAKE_DOMAIN,
+            "instance_id": instance_id,
+            "enabled": True,
+            "values": {},
+            "setup_data": setup_data,
+        },
+    )
+    # what the reconfigure's unload of the instance calls on
+    cast("Any", flow_mass.music).on_provider_unload = AsyncMock()
+    flow_mass.discovery = MagicMock(run_provider_discovery=AsyncMock())
+    return instance_id
+
+
+async def _load_account_provider(flow_mass: MusicAssistant, account: str) -> str:
+    """Add and load an instance of the fake domain signed in to the given account."""
+    instance_id = _store_account_provider(flow_mass, account)
+    await flow_mass.load_provider_config(await flow_mass.config.get_provider_config(instance_id))
+    return instance_id
+
+
+async def _reconfigure_account(
+    flow_mass: MusicAssistant, instance_id: str, account: str
+) -> SetupFlowStep:
+    """Sign the instance in to the given account through its reconfigure flow."""
+
+    async def run_setup(session: SetupSession) -> None:
+        values = await session.form([ConfigEntry(key="token", type=ConfigEntryType.STRING)])
+        await session.finish(values)
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.reconfigure_provider(instance_id)
+        return await flow_mass.config.submit_setup_flow(step.flow_id, {"token": account})
+
+
+def _signed_in_account(flow_mass: MusicAssistant, instance_id: str) -> str | None:
+    """Return the account the loaded instance is signed in to, None when it is not loaded."""
+    provider = flow_mass.get_provider(instance_id)
+    return provider.account if isinstance(provider, _AccountProvider) else None
+
+
+def _bound_account(flow_mass: MusicAssistant, instance_id: str) -> ConfigValueType:
+    return flow_mass.config.get_provider_setup_value(instance_id, CONF_BOUND_ACCOUNT_ID)
+
+
+async def test_first_load_binds_the_account(flow_mass: MusicAssistant) -> None:
+    """The first load of an instance binds it to the account it signed in to."""
+    with _use_account_provider():
+        instance_id = await _load_account_provider(flow_mass, "account-a")
+
+    assert _signed_in_account(flow_mass, instance_id) == "account-a"
+    assert _bound_account(flow_mass, instance_id) == "account-a"
+
+
+async def test_reconfigure_to_the_same_account_succeeds(flow_mass: MusicAssistant) -> None:
+    """Signing in again to the bound account, e.g. after a login expired, is accepted."""
+    with _use_account_provider():
+        instance_id = await _load_account_provider(flow_mass, "account-a")
+        step = await _reconfigure_account(flow_mass, instance_id, "account-a")
+
+    assert step.type == FlowStepType.FINISH, step
+    assert _signed_in_account(flow_mass, instance_id) == "account-a"
+    assert _bound_account(flow_mass, instance_id) == "account-a"
+
+
+async def test_reconfigure_to_another_account_is_refused(flow_mass: MusicAssistant) -> None:
+    """Another account is refused and the instance comes back up on the bound one."""
+    with _use_account_provider():
+        instance_id = await _load_account_provider(flow_mass, "account-a")
+        step = await _reconfigure_account(flow_mass, instance_id, "account-b")
+        assert step.type == FlowStepType.ABORT, step
+        assert step.reason_translation is not None
+        assert step.reason_translation.key == "provider_account_changed"
+
+    assert _signed_in_account(flow_mass, instance_id) == "account-a"
+    conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{instance_id}")
+    assert flow_mass.config.decrypt_string(conf["setup_data"]["token"]) == "account-a"
+    assert _bound_account(flow_mass, instance_id) == "account-a"
+    assert conf.get("last_error") is None
+
+
+async def test_refused_reconfigure_returns_once_the_previous_account_is_back(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A flow retrying after the refusal never runs next to the recovery load."""
+
+    async def slow_init(_provider: _AccountProvider) -> None:
+        await asyncio.sleep(0.05)
+
+    with (
+        _use_account_provider(),
+        patch.object(_AccountProvider, "handle_async_init", slow_init),
+    ):
+        instance_id = await _load_account_provider(flow_mass, "account-a")
+        step = await _reconfigure_account(flow_mass, instance_id, "account-b")
+        assert step.type == FlowStepType.ABORT, step
+        # no recovery load is still in flight when the flow gets its error back
+        assert _signed_in_account(flow_mass, instance_id) == "account-a"
+        step = await _reconfigure_account(flow_mass, instance_id, "account-a")
+        assert step.type == FlowStepType.FINISH, step
+
+    assert _signed_in_account(flow_mass, instance_id) == "account-a"
+
+
+async def test_provider_without_account_is_not_bound(flow_mass: MusicAssistant) -> None:
+    """An instance that does not report its account is never bound or refused."""
+    with _use_account_provider():
+        instance_id = await _load_account_provider(flow_mass, "")
+        step = await _reconfigure_account(flow_mass, instance_id, "")
+
+    assert step.type == FlowStepType.FINISH, step
+    assert flow_mass.get_provider(instance_id) is not None
+    setup_data = flow_mass.config.get(f"{CONF_PROVIDERS}/{instance_id}/setup_data")
+    assert CONF_BOUND_ACCOUNT_ID not in setup_data
+
+
+async def test_bound_provider_that_stops_reporting_its_account_keeps_the_binding(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A load that cannot tell its account is accepted and leaves the binding in place."""
+    with _use_account_provider():
+        instance_id = _store_account_provider(flow_mass, "", bound_account="account-a")
+        await flow_mass.load_provider_config(
+            await flow_mass.config.get_provider_config(instance_id)
+        )
+
+    assert flow_mass.get_provider(instance_id) is not None
+    assert _bound_account(flow_mass, instance_id) == "account-a"
+
+
+async def test_load_on_another_account_fails_with_the_reason(flow_mass: MusicAssistant) -> None:
+    """A plain load signed in to another account leaves the instance down with the reason."""
+    with _use_account_provider():
+        instance_id = _store_account_provider(flow_mass, "account-b", bound_account="account-a")
+        await flow_mass.load_provider(instance_id, allow_retry=True)
+
+    assert flow_mass.get_provider(instance_id) is None
+    conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{instance_id}")
+    assert conf["last_error"]["translation_key"] == "provider_account_changed"
+    assert _bound_account(flow_mass, instance_id) == "account-a"
+    # a different account does not resolve itself, so no retry is scheduled
+    assert f"load_provider_{instance_id}" not in flow_mass._tracked_timers
+
+
+async def test_reconfigure_without_flow_module_aborts(flow_mass: MusicAssistant) -> None:
+    """Reconfigure on a flow-less provider returns a nothing_to_configure ABORT."""
+    instance_id = FAKE_DOMAIN
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{instance_id}",
+        {"type": "music", "domain": FAKE_DOMAIN, "instance_id": instance_id, "enabled": True},
+    )
+    with patch.object(flow_mass.config, "_get_setup_flow_module", AsyncMock(return_value=None)):
+        step = await flow_mass.config.reconfigure_provider(instance_id)
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "nothing_to_configure"
+    assert not flow_mass.config._setup_flows
+
+
+async def test_setup_provider_single_instance_guard(flow_mass: MusicAssistant) -> None:
+    """Setting up a non-multi-instance provider that already exists aborts fast."""
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{FAKE_DOMAIN}",
+        {"type": "music", "domain": FAKE_DOMAIN, "instance_id": FAKE_DOMAIN, "enabled": True},
+    )
+    step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "already_configured"
+
+
+async def test_setup_provider_retired_guard(flow_mass: MusicAssistant) -> None:
+    """Setting up a provider whose manifest is deprecated aborts with the retirement notice."""
+    manifest = flow_mass._provider_manifests[FAKE_DOMAIN]
+    flow_mass._provider_manifests[FAKE_DOMAIN] = replace(manifest, stage=ProviderStage.DEPRECATED)
+    step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "provider_retired"
+    assert step.translation_owner == f"provider.{FAKE_DOMAIN}"
+    assert not flow_mass.config._setup_flows
+
+
+async def test_retired_guard_precedes_the_other_setup_guards(flow_mass: MusicAssistant) -> None:
+    """A retired provider reports the retirement, not that it is already configured."""
+    manifest = flow_mass._provider_manifests[FAKE_DOMAIN]
+    flow_mass._provider_manifests[FAKE_DOMAIN] = replace(manifest, stage=ProviderStage.DEPRECATED)
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{FAKE_DOMAIN}",
+        {"type": "music", "domain": FAKE_DOMAIN, "instance_id": FAKE_DOMAIN, "enabled": True},
+    )
+    step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.reason == "provider_retired"
+
+
+@pytest.mark.parametrize(
+    "stage", [ProviderStage.STABLE, ProviderStage.ALPHA, ProviderStage.UNMAINTAINED]
+)
+async def test_setup_gate_is_specific_to_deprecated(
+    flow_mass: MusicAssistant, stage: ProviderStage
+) -> None:
+    """Every other stage falls through the gate to the ordinary setup guards."""
+    manifest = flow_mass._provider_manifests[FAKE_DOMAIN]
+    flow_mass._provider_manifests[FAKE_DOMAIN] = replace(manifest, stage=stage)
+    flow_mass.config.set(
+        f"{CONF_PROVIDERS}/{FAKE_DOMAIN}",
+        {"type": "music", "domain": FAKE_DOMAIN, "instance_id": FAKE_DOMAIN, "enabled": True},
+    )
+    step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+    assert step.reason == "already_configured"
+
+
+async def test_setup_unknown_provider_domain(flow_mass: MusicAssistant) -> None:
+    """Setting up an unknown provider domain raises."""
+    with pytest.raises(KeyError):
+        await flow_mass.config.setup_provider("_no_such_provider")
+
+
+# a player that was first seen after the split: none of its protocols has its id
+PLAYER_ID = "pl0123456789ab"
+
+
+class _FlowProtocol(MockProtocol):
+    """Mock protocol that implements a setup (pairing) flow."""
+
+    async def run_setup_flow(self, session: SetupSession) -> None:
+        """Run a minimal pairing flow."""
+        values = await session.form(
+            [ConfigEntry(key="pin", type=ConfigEntryType.STRING)], step_id="user"
+        )
+        await session.finish(values)
+
+
+def _attach_player(
+    mass: MusicAssistant,
+    *,
+    own_class: type[MockProtocol] = MockProtocol,
+    audio: tuple[tuple[str, str, bool], ...] = (),
+) -> tuple[Player, MockProtocol, list[MockProtocol]]:
+    """
+    Attach a player with an own protocol and audio protocols, each with a stored config.
+
+    :param mass: The server of the flow tests.
+    :param own_class: The class of the own protocol of the player.
+    :param audio: Per audio protocol: its domain, its id and whether it needs setup. Each
+        has a pairing flow.
+    """
+    player, own = attach_on_config(
+        mass, "test_players", "own_1", "Player One", player_id=PLAYER_ID, protocol_class=own_class
+    )
+    mass.config.create_player_record(
+        PLAYER_ID, provider="test_players", player_type=PlayerType.PLAYER, default_name=None
+    )
+    _store_protocol(mass, "own_1", "test_players", ProtocolRole.NATIVE)
+    audio_protocols: list[MockProtocol] = []
+    for domain, protocol_id, needs_setup in audio:
+        _, protocol = attach_on_config(
+            mass,
+            domain,
+            protocol_id,
+            "Player One",
+            role=ProtocolRole.AUDIO,
+            player=player,
+            protocol_class=_FlowProtocol,
+        )
+        protocol._attr_needs_setup = needs_setup
+        protocol._attr_setup_reason = "pairing_required" if needs_setup else None
+        _store_protocol(mass, protocol_id, domain, ProtocolRole.AUDIO)
+        audio_protocols.append(protocol)
+    player.refresh_state(signal_event=False)
+    return player, own, audio_protocols
+
+
+def _store_protocol(
+    mass: MusicAssistant,
+    protocol_id: str,
+    provider: str,
+    role: ProtocolRole,
+    setup_data: dict[str, Any] | None = None,
+) -> None:
+    """Store the config of a protocol of the player, with what its setup collected."""
+    mass.config.create_protocol_record(
+        protocol_id, provider=provider, player_id=PLAYER_ID, role=role, default_name=None
+    )
+    if setup_data:
+        mass.config.set_protocol_setup_data(protocol_id, setup_data)
+
+
+def _stored_setup_data(mass: MusicAssistant, protocol_id: str) -> dict[str, Any]:
+    """Return what is stored as the setup data of a protocol."""
+    return dict((mass.config.get_protocol_record(protocol_id) or {}).get("setup_data") or {})
+
+
+async def test_player_setup_without_flow_aborts(flow_mass: MusicAssistant) -> None:
+    """Player setup for a player without a run_setup_flow override aborts."""
+    _, own, _ = _attach_player(flow_mass)
+    assert type(own).run_setup_flow is PlayerProtocol.run_setup_flow
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "nothing_to_configure"
+
+
+async def test_a_player_setup_flow_belongs_to_the_admin_who_started_it(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A player's setup flow reaches the admin who started it and other admins, not a service account."""
+    admin = User(user_id="admin", username="admin", role=UserRole.ADMIN)
+    _attach_player(flow_mass, own_class=_FlowProtocol)
+    set_current_user(admin)
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+
+    access = flow_mass.config.get_setup_flow_access(step.flow_id)
+    assert access == SetupFlowAccess(Scope.CONFIG_PLAYERS_WRITE, admin.user_id)
+    assert access.allows(User(user_id="other_admin", username="other_admin", role=UserRole.ADMIN))
+    assert not access.allows(User(user_id="ha", username="ha", role=UserRole.SERVICE))
+
+
+async def test_player_setup_abort_mid_finish_restores_setup_data(
+    flow_mass: MusicAssistant,
+) -> None:
+    """Aborting a player flow while finish() is in flight restores the previous setup_data."""
+    _, own, _ = _attach_player(flow_mass, own_class=_FlowProtocol)
+    original_setup_data = {"pin": flow_mass.config.encrypt_string("0000")}
+    flow_mass.config.set_protocol_setup_data("own_1", original_setup_data)
+    finish_reached = asyncio.Event()
+
+    async def hanging_apply(_protocol_id: str, _changed_keys: set[str]) -> None:
+        finish_reached.set()
+        await asyncio.sleep(3600)
+
+    with patch.object(flow_mass.players, "on_protocol_config_change", hanging_apply):
+        step = await flow_mass.config.setup_player(PLAYER_ID)
+        assert step.type == FlowStepType.FORM
+        submit_task = asyncio.create_task(
+            flow_mass.config.submit_setup_flow(step.flow_id, {"pin": "1234"})
+        )
+        await asyncio.wait_for(finish_reached.wait(), timeout=5)
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+        submit_step = await submit_task
+    # the abort interrupted finish(): the previous setup_data was restored
+    assert _stored_setup_data(flow_mass, "own_1") == original_setup_data
+    assert own.config.setup_data == original_setup_data
+    assert submit_step.type == FlowStepType.ABORT
+
+
+async def test_player_setup_reaches_unavailable_player(flow_mass: MusicAssistant) -> None:
+    """
+    Player setup must not gate on player availability.
+
+    A player that needs setup is serialized as unavailable (available folds in
+    needs_setup), so requesting availability here would lock out exactly the
+    players this command exists for.
+    """
+    player, own, _ = _attach_player(flow_mass, own_class=_FlowProtocol)
+    own._attr_needs_setup = True
+    player.refresh_state(signal_event=False)
+    assert player.available is False
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+
+    assert step.type == FlowStepType.FORM
+
+
+async def test_player_setup_flow_finish(flow_mass: MusicAssistant) -> None:
+    """A player flow persists and applies encrypted setup_data to the protocol of its flow."""
+    events: list[MassEvent] = []
+    flow_mass.subscribe(events.append, EventType.PLAYER_CONFIG_UPDATED)
+    _, own, _ = _attach_player(flow_mass, own_class=_FlowProtocol)
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+    assert step.type == FlowStepType.FORM
+    finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"pin": "1234"})
+
+    assert finish_step.type == FlowStepType.FINISH
+    # the client is told the player, whose id is not that of the protocol
+    assert finish_step.result == {"player_id": PLAYER_ID}
+    stored = _stored_setup_data(flow_mass, "own_1")
+    assert flow_mass.config.decrypt_string(stored["pin"]) == "1234"
+    # the protocol reads it from its config at once
+    assert own.get_setup_value("pin") == "1234"
+    assert "setup_data" not in flow_mass.config.get(f"{CONF_PLAYERS}/{PLAYER_ID}")
+    cast("AsyncMock", flow_mass.players.on_protocol_config_change).assert_awaited_once_with(
+        "own_1", {"setup_data/pin"}
+    )
+    config_event = await _wait_for(lambda: next(iter(events), None))
+    assert config_event.object_id == PLAYER_ID
+
+
+async def test_player_setup_apply_failure_restores_setup_data(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A player setup failure restores the previous setup_data."""
+    _attach_player(flow_mass, own_class=_FlowProtocol)
+    original_setup_data = {"pin": flow_mass.config.encrypt_string("0000")}
+    flow_mass.config.set_protocol_setup_data("own_1", original_setup_data)
+    cast("AsyncMock", flow_mass.players.on_protocol_config_change).side_effect = RuntimeError(
+        "apply failed"
+    )
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+    abort_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"pin": "1234"})
+
+    assert abort_step.type == FlowStepType.ABORT
+    assert abort_step.reason == "apply failed"
+    assert _stored_setup_data(flow_mass, "own_1") == original_setup_data
+
+
+async def test_player_setup_delegates_to_single_audio_protocol(flow_mass: MusicAssistant) -> None:
+    """A player whose audio protocol needs setup runs the flow of that protocol."""
+    _attach_player(flow_mass, audio=(("airplay", "ap_1", True),))
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+    assert step.type == FlowStepType.FORM
+    assert step.step_id == "user"
+    # the flow runs as the protocol: its steps localize under the protocol's provider
+    assert step.translation_owner == "provider.airplay"
+    finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"pin": "4321"})
+
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.result == {"player_id": PLAYER_ID}
+    # persisted to the config of that protocol, not to the player or its own protocol
+    assert flow_mass.config.decrypt_string(_stored_setup_data(flow_mass, "ap_1")["pin"]) == "4321"
+    assert _stored_setup_data(flow_mass, "own_1") == {}
+    assert "setup_data" not in flow_mass.config.get(f"{CONF_PLAYERS}/{PLAYER_ID}")
+
+
+async def test_player_setup_selection_of_the_audio_protocol(flow_mass: MusicAssistant) -> None:
+    """A player with several audio protocols that need setup first asks which to set up."""
+    _attach_player(flow_mass, audio=(("airplay", "ap_1", True), ("sendspin", "ss_1", True)))
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+    # first a selection form listing both protocols
+    assert step.type == FlowStepType.FORM
+    assert step.step_id == "select_child"
+    child_entry = next(entry for entry in step.entries if entry.key == "child")
+    assert {option.value for option in child_entry.options} == {"ap_1", "ss_1"}
+    # pick the sendspin protocol -> the flow retargets and runs that protocol's flow
+    next_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"child": "ss_1"})
+    assert next_step.type == FlowStepType.FORM
+    assert next_step.step_id == "user"
+    assert next_step.translation_owner == "provider.sendspin"
+    finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"pin": "9999"})
+
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.result == {"player_id": PLAYER_ID}
+    assert flow_mass.config.decrypt_string(_stored_setup_data(flow_mass, "ss_1")["pin"]) == "9999"
+    assert _stored_setup_data(flow_mass, "ap_1") == {}
+
+
+async def test_player_setup_reruns_the_flow_when_nothing_needs_setup(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A player whose protocols are all set up still reaches the flow of its audio protocol."""
+    _attach_player(flow_mass, audio=(("airplay", "ap_1", False),))
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+    assert step.type == FlowStepType.FORM
+    assert step.step_id == "user"
+    assert step.translation_owner == "provider.airplay"
+    finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"pin": "1234"})
+
+    assert finish_step.type == FlowStepType.FINISH
+    assert finish_step.result == {"player_id": PLAYER_ID}
+
+
+async def test_player_setup_without_any_flow_aborts(flow_mass: MusicAssistant) -> None:
+    """A player whose protocols offer no flow at all reports nothing to configure."""
+    player, _, _ = _attach_player(flow_mass)
+    attach_on_config(
+        flow_mass, "dlna", "dlna_1", "Player One", role=ProtocolRole.AUDIO, player=player
+    )
+
+    step = await flow_mass.config.setup_player(PLAYER_ID)
+
+    assert step.type == FlowStepType.ABORT
+    assert step.reason == "nothing_to_configure"
+
+
+async def test_player_setup_reason_in_state_fingerprint(flow_mass: MusicAssistant) -> None:
+    """The setup reason of a protocol is published by its player and drives change events."""
+    player, own, _ = _attach_player(flow_mass)
+    own._attr_needs_setup = True
+    own._attr_setup_reason = "pairing_required"
+
+    player.refresh_state(signal_event=False)
+
+    assert player.setup_reason == "pairing_required"
+    assert _state_fingerprint(player.state)["setup_reason"] == "pairing_required"
+
+
+async def test_has_setup_flow_serialized_for_own_flow(flow_mass: MusicAssistant) -> None:
+    """A player whose own protocol has a flow serializes has_setup_flow (regardless of needs_setup)."""
+    player, own, _ = _attach_player(flow_mass, own_class=_FlowProtocol)
+    plain = MockProtocol(MockProvider("plain", mass=cast("MagicMock", flow_mass)), "p_1", "Plain")
+    assert plain.has_setup_flow is False
+    assert own.has_setup_flow is True
+    # not gated on needs_setup: the flow stays re-runnable once setup completed
+    assert own.needs_setup is False
+
+    player.update_state(force_update=True)
+
+    assert player.has_setup_flow is True
+    assert player.to_dict()["has_setup_flow"] is True
+    # tracked leaf of the fingerprint, so a protocol that attaches late drives an event
+    assert _state_fingerprint(player.state)["has_setup_flow"] is True
+
+
+async def test_has_setup_flow_serialized_for_an_audio_protocol(
+    flow_mass: MusicAssistant,
+) -> None:
+    """A player takes has_setup_flow from an audio protocol with a flow."""
+    player, _, _ = _attach_player(flow_mass, audio=(("airplay", "ap_1", False),))
+
+    player.update_state(force_update=True)
+
+    assert player._has_setup_flow is True
+    assert player.to_dict()["has_setup_flow"] is True
+    assert _state_fingerprint(player.state)["has_setup_flow"] is True
+
+
+async def test_secure_values_never_echoed_on_step(flow_mass: MusicAssistant) -> None:
+    """Submitted SECURE_STRING values are handed to the flow but never kept on the step."""
+    received: dict[str, Any] = {}
+
+    async def run_setup(session: SetupSession) -> None:
+        received.update(await session.form([USERNAME_ENTRY, PASSWORD_ENTRY]))
+        # keep the flow alive on a second form so the stored step can be inspected
+        await session.form([USERNAME_ENTRY], step_id="second")
+        await session.finish({})
+
+    with _use_flow(flow_mass, run_setup):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        # validation failure path: the password must not be echoed back
+        error_step = await flow_mass.config.submit_setup_flow(step.flow_id, {"password": "sssh"})
+        password_entry = next(x for x in error_step.entries if x.key == "password")
+        assert password_entry.value is None
+        # success path: the flow receives the value, the stored step does not keep it
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"username": "marcel", "password": "sssh"}
+        )
+        assert received["password"] == "sssh"
+        await flow_mass.config.abort_setup_flow(step.flow_id)
+
+
+# --- real provider setup flows driven through the engine (migrated plain-cred providers) ---
+
+
+async def test_real_provider_flow_qobuz(flow_mass: MusicAssistant) -> None:
+    """Qobuz's run_setup collects credentials and persists them as (encrypted) setup_data."""
+    with (
+        _use_flow(flow_mass, qobuz_run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()) as mock_load,
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.FORM
+        # only the setup credentials are on the form; the quality option stays behind
+        assert {entry.key for entry in step.entries} == {"username", "password"}
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"username": "marcel", "password": "hunter2"}
+        )
+    assert finish_step.type == FlowStepType.FINISH
+    mock_load.assert_awaited_once()
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["username"]) == "marcel"
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["password"]) == "hunter2"
+
+
+async def test_real_provider_flow_filesystem_local(
+    flow_mass: MusicAssistant, tmp_path: Path
+) -> None:
+    """filesystem_local's run_setup collects the content type and folder as setup_data."""
+    folder = tmp_path / "media" / "podcasts"
+    folder.mkdir(parents=True)
+    flow_mass.storage = StorageController(flow_mass)
+    set_locations(flow_mass.storage, make_location(tmp_path / "media"))
+    with (
+        _use_flow(flow_mass, filesystem_local_run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()) as mock_load,
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.FORM
+        assert {"content_type", "path"} <= {entry.key for entry in step.entries}
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"content_type": "podcasts", "path": str(folder)}
+        )
+    assert finish_step.type == FlowStepType.FINISH
+    mock_load.assert_awaited_once()
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["content_type"]) == "podcasts"
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"]["path"]) == str(folder)
+
+
+async def test_real_provider_flow_retry_on_error(flow_mass: MusicAssistant) -> None:
+    """A failing load makes the author's loop re-render the form with the error, then succeed."""
+    load_mock = AsyncMock(side_effect=[LoginFailed("bad creds"), None])
+    with (
+        _use_flow(flow_mass, qobuz_run_setup),
+        patch.object(flow_mass, "load_provider_config", load_mock),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        retry_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"username": "marcel", "password": "wrong"}
+        )
+        assert retry_step.type == FlowStepType.FORM
+        assert retry_step.errors == {"base": "bad creds"}
+        assert retry_step.error_translations["base"].key == "login_failed"
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {"username": "marcel", "password": "right"}
+        )
+    assert finish_step.type == FlowStepType.FINISH
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}") is not None
+
+
+async def test_opensubsonic_error_with_translation_args_is_formatted(
+    flow_mass: MusicAssistant,
+) -> None:
+    """An OpenSubsonic setup error shows its URL instead of a literal translation placeholder."""
+    translations = TranslationController(flow_mass)
+    address = "https://navidrome.example"
+    error = LoginFailed(
+        f"Failed to connect to {address}, check your settings.",
+        translation_key="connect_failed",
+        translation_owner="provider.opensubsonic",
+        translation_args=[address],
+    )
+    load_mock = AsyncMock(side_effect=[error, None])
+    with (
+        _use_flow(flow_mass, opensubsonic_run_setup),
+        patch.object(flow_mass, "load_provider_config", load_mock),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        retry_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_BASE_URL: address}
+        )
+        assert retry_step.type == FlowStepType.FORM
+        assert retry_step.errors == {"base": str(error)}
+        for locale, template in (
+            ("de", "Verbindung zu {0} fehlgeschlagen."),
+            ("nl", "Verbinding met {0} mislukt."),
+        ):
+            translations._locales[locale] = {
+                "provider.opensubsonic.errors.connect_failed": template
+            }
+            token = TRANSLATION_RESOLVER.set(partial(translations.get_translation, locale=locale))
+            try:
+                serialized = retry_step.to_dict()
+            finally:
+                TRANSLATION_RESOLVER.reset(token)
+            assert serialized["errors"] == {"base": template.format(address)}
+            assert "error_translations" not in serialized
+            assert retry_step.errors == {"base": str(error)}
+        invalid_step = await flow_mass.config.submit_setup_flow(step.flow_id, {CONF_BASE_URL: None})
+        assert invalid_step.errors == {CONF_BASE_URL: "required"}
+        assert not invalid_step.error_translations
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_BASE_URL: address}
+        )
+    assert finish_step.type == FlowStepType.FINISH
+
+
+async def test_audible_flow_login_link_and_redirect_form(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Audible flow shows its login link with the redirect URL form and stores auth."""
+    from music_assistant.providers.audible import CONF_AUTH_FILE, CONF_LOCALE  # noqa: PLC0415
+    from music_assistant.providers.audible import setup_flow as audible_flow  # noqa: PLC0415
+
+    login_url = "https://www.amazon.com/ap/signin?openid=abc"
+    auth = SimpleNamespace(
+        adp_token="adp-token",
+        device_private_key="private-key",
+        to_file=MagicMock(),
+    )
+    get_auth_info = AsyncMock(return_value=("verifier", login_url, "serial"))
+    custom_login = AsyncMock(return_value=auth)
+    monkeypatch.setattr(audible_flow, "audible_get_auth_info", get_auth_info)
+    monkeypatch.setattr(audible_flow, "audible_custom_login", custom_login)
+
+    with (
+        _use_flow(flow_mass, audible_flow.run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.FORM
+        assert step.step_id == "user"
+        assert [entry.key for entry in step.entries] == [CONF_LOCALE]
+
+        auth_step = await flow_mass.config.submit_setup_flow(step.flow_id, {CONF_LOCALE: "us"})
+        assert auth_step.type == FlowStepType.FORM
+        assert auth_step.step_id == "authenticate"
+        assert auth_step.translation_params is None
+        assert [entry.key for entry in auth_step.entries] == [
+            "auth_link",
+            audible_flow.CONF_POST_LOGIN_URL,
+        ]
+        assert auth_step.entries[0].translation_params == [login_url]
+
+        redirect_url = "https://www.amazon.com/ap/maplanding?openid.oa2.authorization_code=code"
+        finish_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {audible_flow.CONF_POST_LOGIN_URL: redirect_url}
+        )
+
+    assert finish_step.type == FlowStepType.FINISH
+    custom_login.assert_awaited_once_with("verifier", redirect_url, "serial", "us")
+    auth.to_file.assert_called_once()
+    auth_file = auth.to_file.call_args.args[0]
+    assert auth_file.startswith(flow_mass.storage_path)
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"][CONF_AUTH_FILE]) == auth_file
+    assert flow_mass.config.decrypt_string(raw_conf["setup_data"][CONF_LOCALE]) == "us"
+
+
+async def test_spotify_flow_hosted_bounce_roundtrip(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real Spotify flow: hosted-bounce auth, playback authorization, stored credentials."""
+    from music_assistant.providers.spotify.constants import (  # noqa: PLC0415
+        BACKEND_LIBRESPOT,
+        CONF_LIBRESPOT_CREDENTIALS,
+        CONF_PLAYBACK_BACKEND,
+        CONF_REFRESH_TOKEN_GLOBAL,
+    )
+    from music_assistant.providers.spotify.setup_flow import (  # noqa: PLC0415
+        CONF_PLAYBACK_AUTH_METHOD,
+        CONF_PLAYBACK_CALLBACK_URL,
+        PLAYBACK_AUTH_BROWSER,
+        run_setup,
+    )
+
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.app_var", lambda _key: "ma_client_id"
+    )
+    # seed the lazy http_session backing field so the token exchange uses our stub
+    monkeypatch.setattr(
+        flow_mass,
+        "_http_session",
+        _fake_json_session(
+            {"refresh_token": "rt_global", "access_token": "at_keymaster"},
+            # the account lookup must answer, so the flow really traverses the
+            # premium/duplicate gate instead of skipping it on an unstubbed call
+            get_payload={"id": "u1", "product": "premium"},
+        ),
+    )
+    # the playback steps shell out to librespot; stub the binary lookup and the exchange
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.get_librespot_binary",
+        AsyncMock(return_value="/bin/librespot"),
+    )
+    # librespot stores the account it was authorized for, and it is the one that signed in
+    credentials_via_token = AsyncMock(return_value='{"username": "u1", "auth_data": "d"}')
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.librespot_credentials_via_token",
+        credentials_via_token,
+    )
+    # the browser is not on this host, so the loopback target is unreachable and the flow has
+    # to fall back to asking the user to paste the URL they landed on
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.await_loopback_authorization",
+        MagicMock(side_effect=OSError),
+    )
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        # first step is the (required) global authentication via the hosted bounce
+        assert step.type == FlowStepType.EXTERNAL
+        assert step.step_id == "authenticate"
+        assert step.url is not None
+        assert "accounts.spotify.com/authorize" in step.url
+        # the fixed hosted redirect is used, with the local callback carried in `state`
+        assert "music-assistant.io%2Fcallback" in step.url
+        state = parse_qs(urlsplit(step.url).query)["state"][0]
+        assert step.flow_id in base64.urlsafe_b64decode(state + "=" * (-len(state) % 4)).decode()
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        await _fire_callback(flow_mass, step.flow_id, "code=auth_code&state=xyz")
+        # playback needs an explicit backend choice; stay on librespot here
+        await _wait_for(
+            lambda: (
+                session.current_step is not None
+                and session.current_step.step_id == "playback_backend"
+            )
+        )
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_PLAYBACK_BACKEND: BACKEND_LIBRESPOT}
+        )
+        # the librespot branch then authorizes playback; pick the browser fallback
+        await _wait_for(
+            lambda: (
+                session.current_step is not None and session.current_step.step_id == "playback_auth"
+            )
+        )
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_PLAYBACK_AUTH_METHOD: PLAYBACK_AUTH_BROWSER}
+        )
+        # the browser step advertises the keymaster client id on a loopback redirect, which is
+        # the only redirect Spotify accepts for it, so the user pastes the URL back
+        browser_step = await _wait_for(
+            lambda: (
+                session.current_step
+                if session.current_step is not None
+                and session.current_step.step_id == "playback_browser"
+                else None
+            )
+        )
+        assert browser_step.translation_params is not None
+        authorize_url = browser_step.translation_params[0]
+        assert "65b708073fc0480ea92a077233ca87bd" in authorize_url
+        assert "127.0.0.1" in authorize_url
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id,
+            {CONF_PLAYBACK_CALLBACK_URL: "http://127.0.0.1:5588/login?code=playback_code"},
+        )
+        # the developer key is offered as an opt-in once everything required is collected
+        await _wait_for(
+            lambda: (
+                session.current_step is not None
+                and session.current_step.step_id == "developer_optin"
+            )
+        )
+        # declining the opt-in finishes the flow without asking for a client id
+        finish_step = await flow_mass.config.submit_setup_flow(step.flow_id, {})
+    assert finish_step.type == FlowStepType.FINISH
+    # the pasted URL's code is what gets exchanged for the playback credential
+    assert credentials_via_token.await_args is not None
+    assert credentials_via_token.await_args.args == ("/bin/librespot", "at_keymaster")
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    assert (
+        flow_mass.config.decrypt_string(raw_conf["setup_data"][CONF_REFRESH_TOKEN_GLOBAL])
+        == "rt_global"
+    )
+    assert (
+        flow_mass.config.decrypt_string(raw_conf["setup_data"][CONF_LIBRESPOT_CREDENTIALS])
+        == '{"username": "u1", "auth_data": "d"}'
+    )
+
+
+async def test_gdrive_flow_form_then_hosted_bounce(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real Google Drive flow: credential form, hosted-bounce OAuth, stored refresh token."""
+    from music_assistant.providers.filesystem_cloud.base import (  # noqa: PLC0415
+        CONF_CLIENT_ID,
+        CONF_CLIENT_SECRET,
+        CONF_FOLDER_ID,
+        CONF_REFRESH_TOKEN,
+    )
+    from music_assistant.providers.filesystem_google_drive.setup_flow import (  # noqa: PLC0415
+        run_setup,
+    )
+
+    # seed the lazy http_session backing field so the token exchange uses our stub
+    monkeypatch.setattr(
+        flow_mass, "_http_session", _fake_json_session({"refresh_token": "rt_drive"})
+    )
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        # the shared cloud flow first collects content type + OAuth client credentials + folder
+        assert step.type == FlowStepType.FORM
+        assert step.step_id == "user"
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        external_step = await flow_mass.config.submit_setup_flow(
+            step.flow_id,
+            {
+                "content_type": "music",
+                CONF_CLIENT_ID: "cid",
+                CONF_CLIENT_SECRET: "secret",
+                CONF_FOLDER_ID: "root",
+            },
+        )
+        assert external_step.type == FlowStepType.EXTERNAL
+        assert external_step.url is not None
+        auth_url = urlsplit(external_step.url)
+        assert auth_url.netloc == "accounts.google.com"
+        assert parse_qs(auth_url.query)["redirect_uri"] == ["https://music-assistant.io/callback"]
+        await _fire_callback(flow_mass, step.flow_id, "code=auth_code")
+        await _wait_for(lambda: session.finished)
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    setup_data = raw_conf["setup_data"]
+    assert flow_mass.config.decrypt_string(setup_data[CONF_REFRESH_TOKEN]) == "rt_drive"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_CLIENT_ID]) == "cid"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_FOLDER_ID]) == "root"
+
+
+async def test_tidal_flow_device_login(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real Tidal flow: show the device code, poll until approved, store the tokens."""
+    from music_assistant.providers.tidal.auth_manager import TidalAuthManager  # noqa: PLC0415
+    from music_assistant.providers.tidal.constants import (  # noqa: PLC0415
+        CONF_AUTH_TOKEN,
+        CONF_REFRESH_TOKEN,
+        CONF_USER_ID,
+    )
+    from music_assistant.providers.tidal.setup_flow import run_setup  # noqa: PLC0415
+
+    monkeypatch.setattr(flow_mass, "_http_session", MagicMock())
+    device = {
+        "deviceCode": "dev",
+        "userCode": "ABCDE",
+        "verificationUri": "link.tidal.com",
+        "interval": 0,
+        "expiresIn": 300,
+    }
+    auth_data = {
+        "access_token": "at-123",
+        "refresh_token": "rt-456",
+        "expires_at": 4102444800.0,
+        "userId": 42,
+    }
+    device["verificationUriComplete"] = "link.tidal.com/ABCDE"
+    # hold the poll open so the progress step is observable before it finishes
+    release = asyncio.Event()
+
+    async def _poll(_http_session: Any, _device: dict[str, Any]) -> dict[str, Any]:
+        await release.wait()
+        return auth_data
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(TidalAuthManager, "start_device_login", AsyncMock(return_value=device)),
+        patch.object(TidalAuthManager, "poll_device_login", _poll),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        # single external "Open URL" step (code pre-filled) completed by the poll
+        assert step.type == FlowStepType.EXTERNAL
+        assert step.step_id == "device_login"
+        assert step.url == "https://link.tidal.com/ABCDE"
+        # the code is also shown on the step, so it can be typed on another device
+        assert step.translation_params == ["ABCDE"]
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        # approval resolves the poll and the flow finishes on its own
+        release.set()
+        await _wait_for(lambda: session.finished)
+    raw_conf = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")
+    setup_data = raw_conf["setup_data"]
+    assert flow_mass.config.decrypt_string(setup_data[CONF_AUTH_TOKEN]) == "at-123"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_REFRESH_TOKEN]) == "rt-456"
+    assert setup_data["expiry_time"] == 4102444800.0
+    assert flow_mass.config.decrypt_string(setup_data[CONF_USER_ID]) == "42"
+
+
+async def test_tidal_flow_device_login_denied_aborts(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A denied/failed device authorization aborts the flow with the login_failed reason."""
+    from music_assistant_models.errors import LoginFailed  # noqa: PLC0415
+
+    from music_assistant.providers.tidal.auth_manager import TidalAuthManager  # noqa: PLC0415
+    from music_assistant.providers.tidal.setup_flow import run_setup  # noqa: PLC0415
+
+    monkeypatch.setattr(flow_mass, "_http_session", MagicMock())
+    device = {
+        "deviceCode": "dev",
+        "userCode": "ABCDE",
+        "verificationUri": "link.tidal.com",
+        "interval": 0,
+        "expiresIn": 300,
+    }
+    # hold the poll so the progress step is observable before it aborts
+    release = asyncio.Event()
+
+    async def _poll(_http_session: Any, _device: dict[str, Any]) -> dict[str, Any]:
+        await release.wait()
+        raise LoginFailed("access_denied")
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(TidalAuthManager, "start_device_login", AsyncMock(return_value=device)),
+        patch.object(TidalAuthManager, "poll_device_login", _poll),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        # single external step; a denied poll aborts the flow
+        assert step.type == FlowStepType.EXTERNAL
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        release.set()
+        abort = await _wait_for(
+            lambda: (
+                session.current_step
+                if session.current_step and session.current_step.type == FlowStepType.ABORT
+                else None
+            )
+        )
+        assert abort.reason == "login_failed"
+
+
+async def test_hue_pairing_flow_retry_then_success(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real Hue flow: a missed button press re-forms, then pairing succeeds."""
+    from music_assistant.providers.hue_entertainment.constants import (  # noqa: PLC0415
+        BACKEND_HUE_BRIDGE,
+        CONF_BACKEND,
+        CONF_BRIDGE_HOST,
+        CONF_BRIDGE_ID,
+        CONF_CLIENTKEY,
+        CONF_USERNAME,
+    )
+    from music_assistant.providers.hue_entertainment.setup_flow import run_setup  # noqa: PLC0415
+
+    api_instance = MagicMock()
+    # first pair attempt times out (button not pressed), second succeeds
+    api_instance.pair = AsyncMock(
+        side_effect=[TimeoutError("not pressed"), {"username": "abc", "clientkey": "def"}]
+    )
+    api_instance.get_bridge_id = AsyncMock(return_value="bridge-1")
+    api_instance.close = AsyncMock()
+    monkeypatch.setattr(
+        "music_assistant.providers.hue_entertainment.setup_flow.HueEntertainmentAPI",
+        MagicMock(return_value=api_instance),
+    )
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.FORM
+        assert step.step_id == "backend"
+        step = await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_BACKEND: BACKEND_HUE_BRIDGE}
+        )
+        assert step.step_id == "user"
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        await flow_mass.config.submit_setup_flow(step.flow_id, {CONF_BRIDGE_HOST: "1.2.3.4"})
+        # the missed button press loops back to the user form with an error
+        retry = await _wait_for(
+            lambda: (
+                session.current_step
+                if session.current_step
+                and session.current_step.step_id == "user"
+                and session.current_step.errors
+                else None
+            )
+        )
+        assert retry.errors == {"base": "button_not_pressed"}
+        await flow_mass.config.submit_setup_flow(step.flow_id, {CONF_BRIDGE_HOST: "1.2.3.4"})
+        await _wait_for(lambda: session.finished)
+    setup_data = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")["setup_data"]
+    assert flow_mass.config.decrypt_string(setup_data[CONF_USERNAME]) == "abc"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_CLIENTKEY]) == "def"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_BRIDGE_HOST]) == "1.2.3.4"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_BRIDGE_ID]) == "bridge-1"
+
+
+async def test_netease_qr_flow_expiry_then_confirm(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real NetEase QR flow: the first shown QR expires and is refreshed, then confirmed."""
+    from music_assistant.models.setup_flow import StepExpiredError  # noqa: PLC0415
+    from music_assistant.providers.neteasecloudmusic import setup_flow as nc_flow  # noqa: PLC0415
+    from music_assistant.providers.neteasecloudmusic.constants import (  # noqa: PLC0415
+        CONF_API_BASE_URL,
+        CONF_COOKIE,
+        CONF_UID,
+    )
+
+    monkeypatch.setattr(flow_mass, "_http_session", MagicMock())
+    monkeypatch.setattr(nc_flow, "NcmApiClient", MagicMock())
+    # a fresh QR is minted for the initial show and again after the first one expires
+    create_qr = AsyncMock(
+        side_effect=[("key1", "data:image/png;base64,AAA"), ("key2", "data:image/png;base64,BBB")]
+    )
+    monkeypatch.setattr(nc_flow, "_create_qr", create_qr)
+    # first poll hits the expiry deadline, the second (refreshed) QR is confirmed
+    monkeypatch.setattr(
+        nc_flow,
+        "_poll_qr_login",
+        AsyncMock(side_effect=[StepExpiredError(), ("cookie-xyz", "42")]),
+    )
+    with (
+        _use_flow(flow_mass, nc_flow.run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.FORM
+        assert step.step_id == "user"
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_API_BASE_URL: "http://127.0.0.1:3000"}
+        )
+        await _wait_for(lambda: session.finished)
+    # the QR was minted twice (initial + one in-place refresh after expiry)
+    assert create_qr.await_count == 2
+    setup_data = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")["setup_data"]
+    assert flow_mass.config.decrypt_string(setup_data[CONF_COOKIE]) == "cookie-xyz"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_UID]) == "42"
+    assert flow_mass.config.decrypt_string(setup_data[CONF_API_BASE_URL]) == "http://127.0.0.1:3000"
+
+
+async def test_external_until_completes_on_awaitable(flow_mass: MusicAssistant) -> None:
+    """external_until shows an external step and completes on the awaitable (no callback)."""
+    release = asyncio.Event()
+
+    async def _work() -> dict[str, str]:
+        await release.wait()
+        return {"token": "abc"}
+
+    async def run_setup(session: SetupSession) -> None:
+        result = await session.external_until(
+            _work(),
+            url="https://example.com/device",
+            step_id="device",
+            expires_in=300,
+            copy_text="copy-value",
+        )
+        await session.finish({"token": result["token"]})
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.EXTERNAL
+        assert step.step_id == "device"
+        assert step.url == "https://example.com/device"
+        assert step.copy_text == "copy-value"
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        # completion is driven by the awaitable resolving, not a browser callback
+        release.set()
+        await _wait_for(lambda: session.finished)
+    setup_data = flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}")["setup_data"]
+    assert flow_mass.config.decrypt_string(setup_data["token"]) == "abc"
+
+
+async def test_external_until_raises_on_deadline(flow_mass: MusicAssistant) -> None:
+    """external_until raises StepExpiredError when the awaitable outlives expires_in."""
+    expired = asyncio.Event()
+
+    async def _never() -> None:
+        await asyncio.Event().wait()
+
+    async def run_setup(session: SetupSession) -> None:
+        try:
+            await session.external_until(
+                _never(),
+                url="https://example.com/device",
+                step_id="device",
+                expires_in=0.1,
+            )
+        except StepExpiredError:
+            expired.set()
+            raise
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.EXTERNAL
+        await _wait_for(lambda: expired.is_set())
+
+
+async def test_tidal_flow_device_login_remints_on_expiry(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired device code re-mints a fresh one and the flow completes on the retry."""
+    from music_assistant.providers.tidal.auth_manager import TidalAuthManager  # noqa: PLC0415
+    from music_assistant.providers.tidal.setup_flow import run_setup  # noqa: PLC0415
+
+    monkeypatch.setattr(flow_mass, "_http_session", MagicMock())
+    device = {
+        "deviceCode": "dev",
+        "userCode": "ABCDE",
+        "verificationUri": "link.tidal.com",
+        "verificationUriComplete": "link.tidal.com/ABCDE",
+        "interval": 0,
+        "expiresIn": 0.1,
+    }
+    auth_data = {"access_token": "at", "refresh_token": "rt", "expires_at": 1.0, "userId": 7}
+    polls = {"n": 0}
+
+    async def _poll(_http_session: Any, _device: dict[str, Any]) -> dict[str, Any]:
+        polls["n"] += 1
+        if polls["n"] == 1:
+            # never resolve, so the step's expires_in deadline fires (StepExpiredError)
+            await asyncio.Event().wait()
+        return auth_data
+
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(TidalAuthManager, "start_device_login", AsyncMock(return_value=device)),
+        patch.object(TidalAuthManager, "poll_device_login", _poll),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        assert step.type == FlowStepType.EXTERNAL
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        await _wait_for(lambda: session.finished)
+    # the first (expired) attempt is followed by a re-minted second that succeeds
+    assert polls["n"] == 2
+
+
+async def test_spotify_flow_aborts_on_a_non_premium_account(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Spotify flow stops right after the sign-in when the account has no Premium."""
+    from music_assistant.providers.spotify.setup_flow import run_setup  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.app_var", lambda _key: "ma_client_id"
+    )
+    monkeypatch.setattr(
+        flow_mass,
+        "_http_session",
+        _fake_json_session(
+            {"refresh_token": "rt_global", "access_token": "at_keymaster"},
+            get_payload={"id": "u1", "product": "free"},
+        ),
+    )
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        await _fire_callback(flow_mass, step.flow_id, "code=auth_code&state=xyz")
+        aborted = await _wait_for(
+            lambda: (
+                session.current_step
+                if session.current_step is not None
+                and session.current_step.type == FlowStepType.ABORT
+                else None
+            )
+        )
+        # the flow never reaches the playback authorization, and nothing is persisted
+        assert aborted.reason == "premium_required"
+        assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}") is None
+
+
+async def test_spotify_flow_rejects_playback_authorized_by_another_account(
+    flow_mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Authorizing playback as a different Spotify account re-asks instead of storing it."""
+    from music_assistant.providers.spotify.constants import (  # noqa: PLC0415
+        BACKEND_LIBRESPOT,
+        CONF_PLAYBACK_BACKEND,
+    )
+    from music_assistant.providers.spotify.setup_flow import (  # noqa: PLC0415
+        CONF_PLAYBACK_AUTH_METHOD,
+        CONF_PLAYBACK_CALLBACK_URL,
+        PLAYBACK_AUTH_BROWSER,
+        run_setup,
+    )
+
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.app_var", lambda _key: "ma_client_id"
+    )
+    monkeypatch.setattr(
+        flow_mass,
+        "_http_session",
+        _fake_json_session(
+            {"refresh_token": "rt_global", "access_token": "at_keymaster"},
+            get_payload={"id": "u1", "product": "premium"},
+        ),
+    )
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.get_librespot_binary",
+        AsyncMock(return_value="/bin/librespot"),
+    )
+    # the browser sign-in lands on a Spotify account other than the one that just signed in
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.librespot_credentials_via_token",
+        AsyncMock(return_value='{"username": "someone_else", "auth_data": "d"}'),
+    )
+    monkeypatch.setattr(
+        "music_assistant.providers.spotify.setup_flow.await_loopback_authorization",
+        MagicMock(side_effect=OSError),
+    )
+    with (
+        _use_flow(flow_mass, run_setup),
+        patch.object(flow_mass, "load_provider_config", AsyncMock()),
+    ):
+        step = await flow_mass.config.setup_provider(FAKE_DOMAIN)
+        session = flow_mass.config._setup_flows[step.flow_id].session
+        await _fire_callback(flow_mass, step.flow_id, "code=auth_code&state=xyz")
+        # playback needs an explicit backend choice; stay on librespot here
+        await _wait_for(
+            lambda: (
+                session.current_step is not None
+                and session.current_step.step_id == "playback_backend"
+            )
+        )
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_PLAYBACK_BACKEND: BACKEND_LIBRESPOT}
+        )
+        await _wait_for(
+            lambda: (
+                session.current_step is not None and session.current_step.step_id == "playback_auth"
+            )
+        )
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id, {CONF_PLAYBACK_AUTH_METHOD: PLAYBACK_AUTH_BROWSER}
+        )
+        await _wait_for(
+            lambda: (
+                session.current_step is not None
+                and session.current_step.step_id == "playback_browser"
+            )
+        )
+        await flow_mass.config.submit_setup_flow(
+            step.flow_id,
+            {CONF_PLAYBACK_CALLBACK_URL: "http://127.0.0.1:5588/login?code=playback_code"},
+        )
+        # back at the method step, carrying the reason it was refused
+        retry = await _wait_for(
+            lambda: (
+                session.current_step
+                if session.current_step is not None
+                and session.current_step.step_id == "playback_auth"
+                and session.current_step.errors
+                else None
+            )
+        )
+        assert retry.errors == {"base": "playback_account_mismatch"}
+    # the mismatching credential is never persisted
+    assert flow_mass.config.get(f"{CONF_PROVIDERS}/{FAKE_DOMAIN}") is None
