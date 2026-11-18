@@ -42,6 +42,45 @@ class SourceTransferTests(unittest.TestCase):
             self.assertEqual(run(["git", "show", f"{commit}^:source.txt"], cwd=publisher), "historical")
 
 
+class RuntimeSourceTests(unittest.TestCase):
+    def test_snapshot_preserves_runtime_files_without_workflows_or_upstream_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            run = sync_channel.run
+            run(["git", "init", "--quiet"], cwd=source)
+            run(["git", "config", "user.name", "Test"], cwd=source)
+            run(["git", "config", "user.email", "test@example.test"], cwd=source)
+            workflows = source / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            (workflows / "upstream.yml").write_text("name: Upstream release\n", encoding="utf-8")
+            (source / "source.py").write_text("VERSION = 1\n", encoding="utf-8")
+            run(["git", "add", "."], cwd=source)
+            run(["git", "commit", "--quiet", "--no-gpg-sign", "-m", "upstream"], cwd=source)
+            (workflows / "RELEASE_WORKFLOW_GUIDE.md").write_text("Upstream release guide\n", encoding="utf-8")
+            (source / "source.py").write_text("VERSION = 2\n", encoding="utf-8")
+            run(["git", "add", "."], cwd=source)
+            run(["git", "commit", "--quiet", "--no-gpg-sign", "-m", "runtime patch"], cwd=source)
+            original = run(["git", "rev-parse", "HEAD"], cwd=source)
+
+            snapshot = sync_channel.snapshot_runtime_source(source)
+            self.assertEqual(run(["git", "rev-list", "--parents", "-n", "1", snapshot], cwd=source), snapshot)
+            self.assertEqual(run(["git", "ls-tree", "-r", "--name-only", snapshot], cwd=source), "source.py")
+            self.assertEqual(run(["git", "show", f"{snapshot}:source.py"], cwd=source), "VERSION = 2")
+            self.assertIn(original, run(["git", "show", "-s", "--format=%B", snapshot], cwd=source))
+            self.assertEqual(run(["git", "status", "--porcelain"], cwd=source), "")
+
+            run(["git", "checkout", "--quiet", "--detach", original], cwd=source)
+            self.assertEqual(sync_channel.snapshot_runtime_source(source), snapshot)
+
+            publisher = Path(directory) / "publisher"
+            publisher.mkdir()
+            run(["git", "init", "--quiet"], cwd=publisher)
+            run(["git", "fetch", str(source), f"{snapshot}:refs/ha-store-staging/server"], cwd=publisher)
+            self.assertEqual(run(["git", "rev-list", "--all", "--count"], cwd=publisher), "1")
+            self.assertEqual(run(["git", "show", f"{snapshot}:source.py"], cwd=publisher), "VERSION = 2")
+
+
 class NightlySelectionTests(unittest.TestCase):
     def test_selects_latest_published_nightly_and_ignores_other_releases(self) -> None:
         releases = [

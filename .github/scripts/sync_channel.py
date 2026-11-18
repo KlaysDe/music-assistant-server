@@ -287,6 +287,38 @@ def cherry_pick_series(path: Path, commits: tuple[str, ...]) -> str:
     return run(["git", "rev-parse", "HEAD"], cwd=path)
 
 
+def snapshot_runtime_source(path: Path) -> str:
+    """Create a deterministic source commit without upstream Actions workflows or history."""
+    source_head = run(["git", "rev-parse", "HEAD"], cwd=path)
+    source_date = run(["git", "show", "-s", "--format=%cI", source_head], cwd=path)
+    env = os.environ.copy()
+    env.update(
+        GIT_AUTHOR_NAME="Music Assistant HA Store source",
+        GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_AUTHOR_DATE=source_date,
+        GIT_COMMITTER_NAME="Music Assistant HA Store source",
+        GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_COMMITTER_DATE=source_date,
+    )
+    with tempfile.TemporaryDirectory(prefix="ma-store-source-index-") as directory:
+        env["GIT_INDEX_FILE"] = str(Path(directory) / "index")
+        run(["git", "read-tree", source_head], cwd=path, env=env)
+        run(
+            ["git", "rm", "--cached", "--quiet", "-r", "--ignore-unmatch", "--", ".github/workflows"],
+            cwd=path,
+            env=env,
+        )
+        tree = run(["git", "write-tree"], cwd=path, env=env)
+        commit = run(
+            ["git", "-c", "commit.gpgSign=false", "commit-tree", tree, "-m",
+             f"chore(store): snapshot runtime source\n\nPatched source: {source_head}"],
+            cwd=path,
+            env=env,
+        )
+    run(["git", "checkout", "--quiet", "--detach", commit], cwd=path)
+    return commit
+
+
 def replace_exactly_once(text: str, pattern: str, replacement: str, description: str) -> str:
     """Replace one expected config value, failing closed if the file shape drifted."""
     if len(list(re.finditer(pattern, text, re.MULTILINE))) != 1:
@@ -506,7 +538,8 @@ def resolve_candidate(work_root: Path, release_token: str | None = None) -> Cand
         commits=SERVER_PATCHES,
         base=SERVER_PATCH_BASE,
     )
-    server_result = cherry_pick_series(server_path, SERVER_PATCHES)
+    cherry_pick_series(server_path, SERVER_PATCHES)
+    server_result = snapshot_runtime_source(server_path)
 
     frontend_patch_head = fetch_patch_ref(
         frontend_path, FRONTEND_PATCH_REF, "refs/remotes/channel/frontend-patches"
@@ -519,7 +552,8 @@ def resolve_candidate(work_root: Path, release_token: str | None = None) -> Cand
         commits=FRONTEND_PATCHES,
         base=FRONTEND_PATCH_BASE,
     )
-    frontend_result = cherry_pick_series(frontend_path, FRONTEND_PATCHES)
+    cherry_pick_series(frontend_path, FRONTEND_PATCHES)
+    frontend_result = snapshot_runtime_source(frontend_path)
 
     return Candidate(
         release_tag=release_tag,
